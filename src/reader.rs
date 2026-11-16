@@ -50,12 +50,23 @@ use parquet::format::PageType;
 use parquet::thrift::TSerializable;
 use thrift::protocol::TCompactInputProtocol;
 use vortex::array::ArrayRef;
+use vortex::array::Canonical;
+use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
 use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::Chunked;
 use vortex::array::arrays::ChunkedArray;
+use vortex::array::arrays::Decimal;
+use vortex::array::arrays::DecimalArray;
+use vortex::array::arrays::Dict;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
+use vortex::array::arrays::decimal::DecimalArrayExt;
+use vortex::array::arrays::decimal::check_precision;
+use vortex::array::arrays::decimal::copy_to_canonical_width;
 use vortex::array::builders::builder_with_capacity_in;
 use vortex::array::builtins::ArrayBuiltins;
+use vortex::array::match_each_decimal_value_type;
 use vortex::array::memory::MemorySessionExt;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
@@ -74,6 +85,7 @@ use vortex::layout::SplitRange;
 use vortex::layout::segments::SegmentFuture;
 use vortex::layout::segments::SegmentId;
 use vortex::layout::segments::SegmentSource;
+use vortex::mask::AllOr;
 use vortex::mask::Mask;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::fns::binary::Binary;
@@ -91,6 +103,8 @@ use crate::layout::PageExecutionData;
 use crate::layout::ParquetFieldLayout;
 use crate::offset_index_is_sound;
 use crate::pages;
+use crate::pages::ParquetPlainDictionary;
+use crate::pages::ParquetRleDictionary;
 use crate::segments::SegmentTable;
 use crate::statistics::ParquetStats;
 use crate::statistics::can_prune;
@@ -377,31 +391,25 @@ fn row_selection(row_range: &Range<usize>, mask: &Mask) -> RowSelection {
         selectors.push(RowSelector::skip(row_range.start));
     }
 
-    // Run-length encoded from the mask's bools: a selection is runs, not indices, and building it
-    // per-index would produce one selector per row.
-    let mut run = 0usize;
-    let mut selected = false;
-    for value in mask.iter() {
-        if value == selected {
-            run += 1;
-            continue;
+    // Projected siblings share the mask's cached run boundaries.
+    let whole = [(0, mask.len())];
+    let selected = match mask.slices() {
+        AllOr::All => whole.as_slice(),
+        AllOr::None => &[],
+        AllOr::Some(selected) => selected,
+    };
+    let mut consumed = 0;
+    for &(start, end) in selected {
+        if start > consumed {
+            selectors.push(RowSelector::skip(start - consumed));
         }
-        if run > 0 {
-            selectors.push(if selected {
-                RowSelector::select(run)
-            } else {
-                RowSelector::skip(run)
-            });
+        if end > start {
+            selectors.push(RowSelector::select(end - start));
         }
-        selected = value;
-        run = 1;
+        consumed = end;
     }
-    if run > 0 {
-        selectors.push(if selected {
-            RowSelector::select(run)
-        } else {
-            RowSelector::skip(run)
-        });
+    if consumed < mask.len() {
+        selectors.push(RowSelector::skip(mask.len() - consumed));
     }
 
     RowSelection::from(selectors)
@@ -422,15 +430,15 @@ fn chunk_mask(row_range: &Range<usize>, mask: &Mask, chunk_len: usize) -> Vortex
         return Ok(mask.clone());
     }
     Ok(match mask.indices() {
-        vortex::mask::AllOr::All => Mask::from_slices(
+        AllOr::All => Mask::from_slices(
             chunk_len,
             (row_range.start != row_range.end)
                 .then_some((row_range.start, row_range.end))
                 .into_iter()
                 .collect(),
         ),
-        vortex::mask::AllOr::None => Mask::new_false(chunk_len),
-        vortex::mask::AllOr::Some(indices) => Mask::from_indices(
+        AllOr::None => Mask::new_false(chunk_len),
+        AllOr::Some(indices) => Mask::from_indices(
             chunk_len,
             indices.iter().map(|index| row_range.start + index),
         ),
@@ -438,6 +446,34 @@ fn chunk_mask(row_range: &Range<usize>, mask: &Mask, chunk_len: usize) -> Vortex
 }
 
 impl CachedDecode {
+    /// Uses the validated Arrow decoder for decimal shapes without a safe native normalization.
+    async fn materialize_selected(
+        &self,
+        row_range: &Range<usize>,
+        mask: &Mask,
+    ) -> VortexResult<ArrayRef> {
+        let bytes = self
+            .segment_source
+            .request(self.segment_id)
+            .await?
+            .unwrap_host();
+        let range = self.inputs.byte_offset..self.inputs.byte_offset + self.inputs.byte_length;
+        let array = decode_arrow(
+            &self.inputs,
+            &self.dtype,
+            u64::try_from(mask.true_count())?,
+            bytes,
+            range,
+            Some(row_selection(row_range, mask)),
+        )?;
+        vortex_ensure!(
+            array.len() == mask.true_count(),
+            "materialized projection row count mismatch"
+        );
+        self.inputs.metrics.record_arrow_decode();
+        Ok(array)
+    }
+
     fn logical_is_decimal(&self) -> bool {
         matches!(
             self.inputs
@@ -1591,6 +1627,7 @@ impl LayoutReader for ParquetPageSetReader {
         let decode = self.cached_decode();
         let full = decode.clone().get(None);
         let handle = self.session.handle();
+        let session = self.session.clone();
 
         Ok(async move {
             let mask = mask.await?;
@@ -1610,17 +1647,17 @@ impl LayoutReader for ParquetPageSetReader {
                             || decode.skips_indexed_page(&row_range, &mask).await?)
                     {
                         let array = decode.decode_selected(&row_range, &mask).await?;
-                        return array.apply_bound(&expr);
+                        return project(array, &expr, &decode, &row_range, &mask, &session).await;
                     }
 
                     let mut array = SharedArray::clone(&full).await?;
                     if row_range.start > 0 || row_range.end < array.len() {
-                        array = array.slice(row_range)?;
+                        array = array.slice(row_range.clone())?;
                     }
                     if !mask.all_true() {
-                        array = pages::filter_page_chunks(array, mask)?;
+                        array = pages::filter_page_chunks(array, mask.clone())?;
                     }
-                    array.apply_bound(&expr)
+                    project(array, &expr, &decode, &row_range, &mask, &session).await
                 })
                 .await
         }
@@ -1861,6 +1898,7 @@ impl LayoutReader for ParquetFieldReader {
         // full decode (including outer decompression) is shared without making empty masks eager.
         let full = decode.clone().get(None);
         let handle = self.session.handle();
+        let session = self.session.clone();
 
         Ok(async move {
             let mask = mask.await?;
@@ -1889,7 +1927,7 @@ impl LayoutReader for ParquetFieldReader {
                             || decode.skips_indexed_page(&row_range, &mask).await?)
                     {
                         let array = decode.decode_selected(&row_range, &mask).await?;
-                        return array.apply_bound(&expr);
+                        return project(array, &expr, &decode, &row_range, &mask, &session).await;
                     }
 
                     let mut array = SharedArray::clone(&full).await?;
@@ -1900,15 +1938,90 @@ impl LayoutReader for ParquetFieldReader {
                         let mask = chunk_mask(&row_range, &mask, array.len())?;
                         array = pages::filter_page_chunks(array, mask)?;
                     } else if row_range.start > 0 || row_range.end < array.len() {
-                        array = array.slice(row_range)?;
+                        array = array.slice(row_range.clone())?;
                     }
 
-                    array.apply_bound(&expr)
+                    project(array, &expr, &decode, &row_range, &mask, &session).await
                 })
                 .await
         }
         .boxed())
     }
+}
+
+/// Executes a selected output column before its column task joins the batch assembly.
+async fn project(
+    array: ArrayRef,
+    expr: &BoundExpression,
+    decode: &CachedDecode,
+    row_range: &Range<usize>,
+    mask: &Mask,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    let array = array.apply_bound(expr)?;
+    if !decode.inputs.options.materialize_projections() {
+        return Ok(array);
+    }
+    // Keep computed decimals deferred until their producers' precision guarantees are established.
+    if matches!(array.dtype(), DType::Decimal(..)) && !expr.is_root() {
+        return Ok(array);
+    }
+    let materialized = {
+        let mut ctx = session.create_execution_ctx();
+        if matches!(array.dtype(), DType::Decimal(..)) {
+            materialize_decimal(array, &mut ctx)?
+        } else {
+            Some(array.execute::<Canonical>(&mut ctx)?.into_array())
+        }
+    };
+    match materialized {
+        Some(array) => Ok(array),
+        None => decode.materialize_selected(row_range, mask).await,
+    }
+}
+
+/// Normalizes selected decimal leaves before a canonical builder can narrow or concatenate them.
+fn materialize_decimal(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<ArrayRef>> {
+    // Dictionary takes can narrow values while executing. Keep the checked Arrow row-selection
+    // fallback for these shapes rather than validate unreferenced dictionary entries.
+    if array.depth_first_traversal().any(|child| {
+        child.is::<Dict>()
+            || child.is::<ParquetRleDictionary>()
+            || child.is::<ParquetPlainDictionary>()
+    }) {
+        return Ok(None);
+    }
+    let array = array.execute_until::<Chunked>(ctx)?;
+    if let Some(chunked) = array.as_opt::<Chunked>() {
+        let mut chunks = Vec::with_capacity(chunked.nchunks());
+        for chunk in chunked.chunks() {
+            let Some(chunk) = materialize_decimal(chunk, ctx)? else {
+                return Ok(None);
+            };
+            chunks.push(chunk);
+        }
+        let normalized = ChunkedArray::try_new(chunks, array.dtype().clone())?.into_array();
+        return Ok(Some(normalized.execute::<Canonical>(ctx)?.into_array()));
+    }
+    let Some(decimal) = array.as_opt::<Decimal>() else {
+        return Ok(None);
+    };
+    let dtype = decimal.decimal_dtype();
+    let validity = decimal.validity()?;
+    let mask = validity.execute_mask(array.len(), ctx)?;
+    let width = dtype.canonical_values_type();
+    if decimal.values_type() == width {
+        match_each_decimal_value_type!(decimal.values_type(), |T| {
+            check_precision(decimal.buffer::<T>().as_slice(), &mask, dtype)
+        })?;
+        return Ok(Some(array));
+    }
+    let values = match_each_decimal_value_type!(decimal.values_type(), |T| {
+        copy_to_canonical_width(decimal.buffer::<T>().as_slice(), &mask, dtype)
+    })?;
+    Ok(Some(
+        DecimalArray::try_new_handle(values, width, dtype, validity)?.into_array(),
+    ))
 }
 
 /// Decodes a column chunk through arrow-rs.
