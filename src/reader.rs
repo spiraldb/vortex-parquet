@@ -452,6 +452,40 @@ impl CachedDecode {
         )
     }
 
+    /// Reuses one lazy decode when sparse integer consumers still need every page.
+    fn can_reuse_full_integer_chunk(
+        &self,
+        selected: &SelectedPages,
+        row_range: &Range<usize>,
+    ) -> bool {
+        if row_range.start != 0
+            || u64::try_from(row_range.end).ok() != Some(self.row_count)
+            || selected.selected_locations != selected.all_locations
+        {
+            return false;
+        }
+        let [range] = selected.ranges.as_slice() else {
+            return false;
+        };
+        if range.start != self.inputs.byte_offset
+            || Some(range.end) != self.inputs.byte_offset.checked_add(self.inputs.byte_length)
+        {
+            return false;
+        }
+        let schema = self.inputs.metadata.file_metadata().schema_descr();
+        let Some(leaf) = pages::single_leaf_index(schema, self.inputs.root_column) else {
+            return false;
+        };
+        let column = schema.column(leaf);
+        column.max_rep_level() == 0
+            && column.max_def_level() <= 1
+            && matches!(
+                (&self.dtype, column.physical_type()),
+                (DType::Primitive(PType::I32, _), PhysicalType::INT32)
+                    | (DType::Primitive(PType::I64, _), PhysicalType::INT64)
+            )
+    }
+
     /// Whether this chunk should be decoded through `mask` rather than in full.
     ///
     /// The result cannot be reused for another mask, so selection is reserved for masks retaining at
@@ -544,6 +578,18 @@ impl CachedDecode {
                 .unwrap_or(indexed.inputs.byte_length);
             if let Some(selected_pages) = selected.filter(|selection| !selection.ranges.is_empty())
             {
+                // Offset indexes were validated before page selection. With every page selected,
+                // matching integer storage has no adaptation that could inspect unselected rows.
+                if self.can_reuse_full_integer_chunk(&selected_pages, row_range) {
+                    let full = self.clone().get(None);
+                    let array = SharedArray::clone(&full).await?;
+                    vortex_ensure!(
+                        u64::try_from(array.len())? == self.row_count,
+                        "cached integer chunk does not match the declared row count"
+                    );
+                    return self
+                        .finish_selected(pages::filter_page_chunks(array, mask.clone())?, mask);
+                }
                 let SelectedPages {
                     ranges,
                     all_locations,
@@ -705,10 +751,14 @@ impl CachedDecode {
         if !used_page_decoder {
             self.inputs.metrics.record_arrow_decode();
         }
-        self.inputs
-            .metrics
-            .record_selective_decode(rows, u64::try_from(mask.len())?);
+        self.finish_selected(array, mask)
+    }
 
+    fn finish_selected(&self, array: ArrayRef, mask: &Mask) -> VortexResult<ArrayRef> {
+        self.inputs.metrics.record_selective_decode(
+            u64::try_from(mask.true_count())?,
+            u64::try_from(mask.len())?,
+        );
         if array.len() != mask.true_count() {
             vortex_bail!(
                 "a selective decode of {} returned {} rows, expected {}",

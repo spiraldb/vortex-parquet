@@ -48,6 +48,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
+use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ChunkedArray;
 use vortex::array::arrays::Dict;
@@ -82,6 +83,7 @@ use vortex::expr::list_contains_opts;
 use vortex::expr::lit;
 use vortex::expr::not_eq;
 use vortex::expr::or;
+use vortex::expr::or_collect;
 use vortex::expr::root;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
@@ -1537,6 +1539,55 @@ fn a_file_without_an_offset_index_uses_lazy_header_pages() {
 }
 
 #[test]
+fn sparse_rows_from_each_page_preserve_nullable_strings() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(400))
+            .set_data_page_row_count_limit(100)
+            .set_data_page_size_limit(1024 * 1024)
+            .set_write_batch_size(25)
+            .build();
+        let reader = open(
+            &session,
+            write_parquet_with_properties(&flat_table_n(400), properties),
+        )
+        .await
+        .unwrap();
+        let selected = or_collect([
+            eq(get_item("id", root()), lit(3_i64)),
+            eq(get_item("id", root()), lit(103_i64)),
+            eq(get_item("id", root()), lit(203_i64)),
+            eq(get_item("id", root()), lit(303_i64)),
+        ])
+        .unwrap();
+        let actual = ScanBuilder::new(session.clone(), Arc::clone(&reader))
+            .with_filter(selected.bind(reader.dtype()).unwrap())
+            .with_projection(get_item("name", root()).bind(reader.dtype()).unwrap())
+            .with_ordered(true)
+            .into_array_stream()
+            .unwrap()
+            .read_all()
+            .await
+            .unwrap();
+        let expected = session
+            .arrow()
+            .from_arrow_array(
+                arrow_bridge::import_array(&StringArray::from(vec![
+                    None,
+                    Some("label-01"),
+                    Some("label-05"),
+                    Some("label-03"),
+                ]))
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(render(&actual, &session), render(&expected, &session));
+    })
+}
+
+#[test]
 fn a_sparse_scan_loads_the_available_offset_index_lazily() {
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
@@ -1905,6 +1956,47 @@ fn filters_crossing_a_row_group_boundary_are_correct() {
                 }
             }
         }
+    })
+}
+
+#[test]
+fn sparse_filter_and_projection_share_an_integer_chunk() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let format = ParquetFormat::new();
+        let bytes = write_parquet(&flat_table(), 40);
+        let reader = format
+            .open(FileHandle::new(
+                Arc::new(bytes.clone()),
+                bytes.len() as u64,
+                session.clone(),
+            ))
+            .await
+            .unwrap();
+        let range = 0..40;
+        let first = eq(get_item("score", root()), lit(3.0_f64))
+            .bind(reader.dtype())
+            .unwrap();
+        let second = gt_eq(get_item("id", root()), lit(0_i64))
+            .bind(reader.dtype())
+            .unwrap();
+        let projection = get_item("id", root()).bind(reader.dtype()).unwrap();
+        let mask = reader
+            .filter_evaluation(&range, &first, MaskFuture::ready(Mask::new_true(40)))
+            .unwrap();
+        let mask = reader.filter_evaluation(&range, &second, mask).unwrap();
+        let result = reader
+            .projection_evaluation(&range, &projection, mask)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(
+            render(&result, &session),
+            format!("{:?}", Int64Array::from(vec![2]))
+        );
+        let counts = format.metrics().snapshot();
+        assert_eq!(counts.selective_decodes, 1);
+        assert_eq!(counts.page_decodes, 2);
     })
 }
 
