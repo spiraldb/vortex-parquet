@@ -78,6 +78,8 @@ pub struct FileContext {
     pub metadata: Arc<ParquetMetaData>,
     /// arrow-rs's view of the same footer, with string columns requested as Arrow view types.
     pub arrow_metadata: ArrowReaderMetadata,
+    /// Internal decoder schema with canonical-width flat decimals; public statistics use the original schema.
+    pub decoder_metadata: ArrowReaderMetadata,
     /// The total length of the file, needed to satisfy arrow-rs's absolute offsets.
     pub file_len: u64,
     /// Which decode path this file's chunks took. See [`crate::metrics`].
@@ -150,7 +152,7 @@ impl ParquetFieldData {
         ChunkDecode {
             file: self.ctx.file.clone(),
             metadata: Arc::clone(&self.ctx.metadata),
-            arrow_metadata: self.ctx.arrow_metadata.clone(),
+            arrow_metadata: self.ctx.decoder_metadata.clone(),
             file_len: self.ctx.file_len,
             metrics: Arc::clone(&self.ctx.metrics),
             options: self.ctx.options,
@@ -244,7 +246,7 @@ impl PageExecutionData {
         ChunkDecode {
             file: self.ctx.file.clone(),
             metadata: Arc::clone(&self.ctx.metadata),
-            arrow_metadata: self.ctx.arrow_metadata.clone(),
+            arrow_metadata: self.ctx.decoder_metadata.clone(),
             file_len: self.ctx.file_len,
             metrics: Arc::clone(&self.ctx.metrics),
             options: self.ctx.options,
@@ -414,6 +416,7 @@ mod tests {
             decode_cache: Arc::new(DecodeCache::new(CachePolicy::default())),
             file_id: FileId::next(),
             metadata,
+            decoder_metadata: arrow_metadata.clone(),
             arrow_metadata,
             file_len: bytes.len() as u64,
             metrics: Arc::default(),

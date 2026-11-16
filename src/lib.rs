@@ -81,6 +81,7 @@ mod statistics;
 
 use std::sync::Arc;
 
+use arrow_schema::Schema;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::file::metadata::ColumnChunkMetaData;
@@ -128,6 +129,7 @@ use crate::layout::ParquetFieldData;
 use crate::layout::field_layout;
 use crate::metrics::ScanMetrics;
 use crate::options::ReaderOptions;
+use crate::pages::single_leaf_index;
 use crate::reader::SharedArrayFuture;
 use crate::segments::SegmentTable;
 
@@ -350,6 +352,7 @@ fn open_inner_with_metadata(
 pub struct PreparedParquetMetadata {
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
+    decoder_metadata: ArrowReaderMetadata,
     dtype: DType,
     root_leaves: Arc<[Vec<usize>]>,
     file_len: u64,
@@ -415,9 +418,11 @@ impl PreparedParquetMetadata {
                 }
             }
         }
+        let decoder_metadata = canonical_decimal_metadata(&metadata, &arrow_metadata);
         Ok(Self {
             metadata,
             arrow_metadata,
+            decoder_metadata,
             dtype,
             root_leaves: root_leaves.into(),
             file_len: file.size(),
@@ -430,20 +435,17 @@ impl PreparedParquetMetadata {
     }
 
     /// An approximate memory charge for bounded metadata caches, excluding shared runtime state.
-    /// Schema fields are charged twice to account for both Arrow and Vortex representations.
+    /// Logical fields are charged for Vortex, and each distinct Arrow schema includes its root metadata.
     pub fn memory_size(&self) -> usize {
         size_of::<Self>()
             + self.metadata.memory_size()
-            + 2 * self.arrow_metadata.schema().fields().size()
-            + self
-                .arrow_metadata
-                .schema()
-                .metadata()
-                .iter()
-                .map(|(key, value)| {
-                    size_of::<(String, String)>() + key.capacity() + value.capacity()
-                })
-                .sum::<usize>()
+            + self.arrow_metadata.schema().fields().size()
+            + schema_memory_size(self.arrow_metadata.schema())
+            + if Arc::ptr_eq(self.arrow_metadata.schema(), self.decoder_metadata.schema()) {
+                0
+            } else {
+                schema_memory_size(self.decoder_metadata.schema())
+            }
             + self.root_leaves.len() * size_of::<Vec<usize>>()
             + self
                 .root_leaves
@@ -451,6 +453,16 @@ impl PreparedParquetMetadata {
                 .map(|leaves| leaves.capacity() * size_of::<usize>())
                 .sum::<usize>()
     }
+}
+
+/// Charges fields and owned root metadata for one Arrow schema.
+fn schema_memory_size(schema: &Schema) -> usize {
+    schema.fields().size()
+        + schema
+            .metadata()
+            .iter()
+            .map(|(key, value)| size_of::<(String, String)>() + key.capacity() + value.capacity())
+            .sum::<usize>()
 }
 
 /// Fresh file identity and reader context backed by reusable immutable metadata.
@@ -489,6 +501,7 @@ impl PreparedFile {
             file_id: FileId::next(),
             metadata: Arc::clone(&metadata.metadata),
             arrow_metadata: metadata.arrow_metadata.clone(),
+            decoder_metadata: metadata.decoder_metadata.clone(),
             file_len: metadata.file_len,
             metrics,
             options,
@@ -808,17 +821,73 @@ fn arrow_metadata_with_view_types(
     }
 }
 
+/// Reuses native integer buffers for flat decimals without changing the public Arrow schema.
+fn canonical_decimal_metadata(
+    metadata: &Arc<ParquetMetaData>,
+    original: &ArrowReaderMetadata,
+) -> ArrowReaderMetadata {
+    use arrow_schema::DataType;
+    use arrow_schema::Fields;
+    use parquet::basic::Type as PhysicalType;
+
+    let parquet_schema = metadata.file_metadata().schema_descr();
+    let mut changed = false;
+    let fields: Fields = original
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(root, field)| {
+            let DataType::Decimal128(precision, scale) = field.data_type() else {
+                return Arc::clone(field);
+            };
+            if field.extension_type_name().is_some() || !(5..=18).contains(precision) {
+                return Arc::clone(field);
+            }
+            let Some(leaf) = single_leaf_index(parquet_schema, root) else {
+                return Arc::clone(field);
+            };
+            let descriptor = parquet_schema.column(leaf);
+            if descriptor.path().parts().len() != 1
+                || descriptor.max_rep_level() != 0
+                || descriptor.max_def_level() > 1
+            {
+                return Arc::clone(field);
+            }
+            let data_type = match (descriptor.physical_type(), *precision) {
+                (PhysicalType::INT32, 5..=9) => DataType::Decimal32(*precision, *scale),
+                (PhysicalType::INT64, 10..=18) => DataType::Decimal64(*precision, *scale),
+                _ => return Arc::clone(field),
+            };
+            changed = true;
+            Arc::new(field.as_ref().clone().with_data_type(data_type))
+        })
+        .collect();
+    if !changed {
+        return original.clone();
+    }
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        original.schema().metadata().clone(),
+    ));
+    ArrowReaderMetadata::try_new(
+        Arc::clone(metadata),
+        ArrowReaderOptions::default().with_schema(schema),
+    )
+    .unwrap_or_else(|_| original.clone())
+}
+
 /// Rewrites a schema's string and binary types to their view equivalents, recursively.
 ///
 /// The reader and benchmark control arms use this to agree on their Arrow output schema.
 /// Parquet dictionary encoding does not change the schema produced here.
-pub fn view_typed_schema(schema: &arrow_schema::Schema) -> arrow_schema::Schema {
+pub fn view_typed_schema(schema: &Schema) -> Schema {
     let fields: arrow_schema::Fields = schema
         .fields()
         .iter()
         .map(|field| Arc::new(view_typed_field(field)))
         .collect();
-    arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone())
+    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// Rewrites one field's type, descending into nested types.
