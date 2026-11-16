@@ -45,6 +45,7 @@ pub(crate) enum SnappyDecoderKind {
 /// constructed, not during page execution, so a benchmark process observes one stable policy.
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderOptions {
+    materialize_projections: bool,
     filter_eval_threshold: f64,
     selective_decode_threshold: f64,
     filter_kernel_thresholds: [f64; ENCODING_COUNT],
@@ -54,6 +55,7 @@ pub struct ReaderOptions {
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
+            materialize_projections: false,
             filter_eval_threshold: 0.2,
             selective_decode_threshold: 0.1,
             // Dense masks are cheaper to decode in bulk and filter afterwards. Decoder skipping
@@ -81,6 +83,18 @@ impl ReaderOptions {
 
     pub(crate) fn snappy_decoder(&self) -> Option<SnappyDecoderKind> {
         self.snappy_decoder
+    }
+
+    /// Materializes selected projected columns inside their independently scheduled tasks.
+    /// Computed decimal projections retain deferred execution. The default keeps all native page
+    /// arrays deferred for consumers that can use them.
+    pub fn with_materialized_projections(mut self) -> Self {
+        self.materialize_projections = true;
+        self
+    }
+
+    pub(crate) fn materialize_projections(&self) -> bool {
+        self.materialize_projections
     }
 
     /// Reads valid density overrides from the process environment on top of the defaults.

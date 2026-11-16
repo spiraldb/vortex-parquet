@@ -40,9 +40,12 @@ use parking_lot::Mutex;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
+use parquet::data_type::Int64Type;
 use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 use parquet::file::properties::WriterVersion;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 use parquet::thrift::TSerializable;
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
@@ -261,6 +264,74 @@ fn write_parquet_with_properties(batch: &RecordBatch, properties: WriterProperti
     ByteBuffer::copy_from(bytes)
 }
 
+/// Writes two data pages with INT64 decimal storage independently of the declared precision.
+fn small_precision_decimal_file(values: &[i64], levels: &[i16], dictionary: bool) -> ByteBuffer {
+    let schema = Arc::new(
+        parse_message_type(
+            "message test { REQUIRED INT64 id; OPTIONAL INT64 amount (DECIMAL(2,0)); }",
+        )
+        .unwrap(),
+    );
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .set_dictionary_enabled(dictionary)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build(),
+    );
+    let mut bytes = Vec::new();
+    let mut writer = SerializedFileWriter::new(&mut bytes, schema, properties).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    let mut ids = group.next_column().unwrap().unwrap();
+    ids.typed::<Int64Type>()
+        .write_batch(&[0, 1, 2, 3], None, None)
+        .unwrap();
+    ids.close().unwrap();
+    let mut amounts = group.next_column().unwrap().unwrap();
+    amounts
+        .typed::<Int64Type>()
+        .write_batch(values, Some(levels), None)
+        .unwrap();
+    amounts.close().unwrap();
+    group.close().unwrap();
+    writer.close().unwrap();
+    ByteBuffer::copy_from(bytes)
+}
+
+async fn open_materialized(
+    session: &VortexSession,
+    bytes: ByteBuffer,
+) -> VortexResult<LayoutReaderRef> {
+    let size = bytes.len() as u64;
+    ParquetFormat::new()
+        .with_options(ReaderOptions::default().with_materialized_projections())
+        .open(FileHandle::new(Arc::new(bytes), size, session.clone()))
+        .await
+}
+
+async fn read_materialized_amounts(
+    session: &VortexSession,
+    bytes: ByteBuffer,
+    filter: Option<Expression>,
+) -> VortexResult<ArrayRef> {
+    let reader = open_materialized(session, bytes).await?;
+    scan(session, reader, filter)
+        .await?
+        .apply(&get_item("amount", root()))
+}
+
+fn assert_amounts(actual: &ArrayRef, expected: &[Option<i64>], session: &VortexSession) {
+    let expected = Decimal64Array::from(expected.to_vec())
+        .with_precision_and_scale(2, 0)
+        .unwrap();
+    let expected = session
+        .arrow()
+        .from_arrow_array(arrow_bridge::import_array(&expected).unwrap(), true)
+        .unwrap();
+    assert_eq!(render(actual, session), render(&expected, session));
+}
+
 #[derive(Clone)]
 struct RecordingReadAt {
     data: ByteBuffer,
@@ -421,8 +492,11 @@ fn physical_integers_decode_directly_to_narrow_unsigned_and_temporal_types() {
                         render(&result, &session),
                         render(&reference(&batch), &session)
                     );
-                    assert_eq!(format.metrics().arrow_decodes(), 0);
-                    assert_eq!(format.metrics().page_decodes(), batch.num_columns() as u64);
+                    assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
+                    assert_eq!(
+                        format.metrics().snapshot().page_decodes,
+                        batch.num_columns() as u64
+                    );
                 }
             }
         }
@@ -458,8 +532,8 @@ fn int64_decimals_decode_filter_and_prune_in_the_unscaled_domain() {
         .await
         .unwrap();
         assert_eq!(result.len(), 200);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-        assert!(format.metrics().page_decodes() > 0);
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
+        assert!(format.metrics().snapshot().page_decodes > 0);
     })
 }
 
@@ -956,12 +1030,119 @@ fn bloom_filter_prunes_an_absent_value_inside_footer_bounds() {
         .unwrap();
         assert_eq!(result.len(), 0);
         assert_eq!(format.metrics().bloom_filter_decodes(), 1);
-        assert_eq!(format.metrics().page_decodes(), 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
+        assert_eq!(format.metrics().snapshot().page_decodes, 0);
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
         assert!(
             reads.lock().len() > open_reads,
             "Bloom bytes were never read"
         );
+    })
+}
+
+#[test]
+fn materialized_projections_preserve_selected_nullable_rows() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let batch = flat_table();
+        let bytes = write_parquet(&batch, 40);
+        let format = ParquetFormat::new()
+            .with_options(ReaderOptions::default().with_materialized_projections());
+        let reader = format
+            .open(FileHandle::new(
+                Arc::new(bytes.clone()),
+                bytes.len() as u64,
+                session.clone(),
+            ))
+            .await
+            .unwrap();
+        let result = scan(
+            &session,
+            reader,
+            Some(not_eq(get_item("id", root()), lit(2_i64))),
+        )
+        .await
+        .unwrap();
+        let expected = reference(&batch)
+            .filter((0..40).map(|id| id != 2).collect())
+            .unwrap();
+        assert_eq!(render(&result, &session), render(&expected, &session));
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
+        assert!(format.metrics().snapshot().page_decodes > 0);
+    })
+}
+
+#[test]
+fn selected_decimal_over_precision_returns_an_error() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = small_precision_decimal_file(&[12, 34, 1_000, 56], &[1, 1, 1, 1], false);
+        let error = read_materialized_amounts(&session, bytes, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("precision"), "{error}");
+    })
+}
+
+#[test]
+fn rejected_decimal_over_precision_is_not_evaluated() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = small_precision_decimal_file(&[12, 34, 1_000, 56], &[1, 1, 1, 1], false);
+        let actual = read_materialized_amounts(
+            &session,
+            bytes,
+            Some(not_eq(get_item("id", root()), lit(2_i64))),
+        )
+        .await
+        .unwrap();
+        assert_amounts(&actual, &[Some(12), Some(34), Some(56)], &session);
+    })
+}
+
+#[test]
+fn materialized_decimal_pages_preserve_nulls() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = small_precision_decimal_file(&[12, 34, 56], &[1, 1, 0, 1], false);
+        let actual = read_materialized_amounts(&session, bytes, None)
+            .await
+            .unwrap();
+        assert_amounts(&actual, &[Some(12), Some(34), None, Some(56)], &session);
+    })
+}
+
+#[test]
+fn dictionary_decimal_fallback_checks_selected_values() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = small_precision_decimal_file(&[12, 34, 1_000, 56], &[1, 1, 1, 1], true);
+        let error = read_materialized_amounts(&session, bytes, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("precision"), "{error}");
+    })
+}
+
+#[test]
+fn dictionary_decimal_fallback_ignores_rejected_values_in_a_row_range() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = small_precision_decimal_file(&[12, 34, 1_000, 56], &[1, 1, 1, 1], true);
+        let reader = open_materialized(&session, bytes).await.unwrap();
+        let filter = eq(get_item("id", root()), lit(3_i64))
+            .bind(reader.dtype())
+            .unwrap();
+        let result = ScanBuilder::new(session.clone(), reader)
+            .with_row_range(1..4)
+            .with_filter(filter)
+            .with_ordered(true)
+            .into_array_stream()
+            .unwrap()
+            .read_all()
+            .await
+            .unwrap();
+        let actual = result.apply(&get_item("amount", root())).unwrap();
+        assert_amounts(&actual, &[Some(56)], &session);
     })
 }
 
@@ -1503,8 +1684,8 @@ fn a_file_without_an_offset_index_uses_lazy_header_pages() {
             .await
             .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-        assert!(format.metrics().page_decodes() > 0);
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
+        assert!(format.metrics().snapshot().page_decodes > 0);
         assert_eq!(format.metrics().offset_index_decodes(), 0);
         let mut name_reads = reads.lock()[open_reads..]
             .iter()
@@ -1602,8 +1783,8 @@ fn a_sparse_scan_loads_the_available_offset_index_lazily() {
         assert_eq!(result.len(), 1);
         assert!(reads.lock().len() > open_reads);
         assert!(format.metrics().offset_index_decodes() > 0);
-        assert!(format.metrics().page_decodes() > 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
+        assert!(format.metrics().snapshot().page_decodes > 0);
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
         let data_reads = reads.lock()[open_reads..].to_vec();
         for chunk in chunk_ranges {
             let mut covered = data_reads
@@ -1775,8 +1956,8 @@ fn dynamic_filters_refine_footer_and_page_pruning_without_reloading_indexes() {
             .await
             .unwrap();
         assert_eq!(result.len(), 0);
-        assert_eq!(format.metrics().page_decodes(), 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
+        assert_eq!(format.metrics().snapshot().page_decodes, 0);
+        assert_eq!(format.metrics().snapshot().arrow_decodes, 0);
     })
 }
 
