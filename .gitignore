@@ -1,0 +1,7 @@
+/target
+/data/
+/results/
+/profiles/
+
+__pycache__/
+/duckdb/benchmarks/

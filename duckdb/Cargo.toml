@@ -1,0 +1,40 @@
+[package]
+name = "vortex-parquet-duckdb"
+description = "Scan Parquet through Vortex from DuckDB."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[features]
+bundled = ["duckdb/bundled"]
+loadable-extension = ["duckdb/loadable-extension"]
+
+[dependencies]
+# Pin both the C table-function API and the C++ vector ABI.
+duckdb = { version = "=1.20000.2", features = ["vtab"] }
+futures = "0.3"
+num-traits = "0.2"
+parking_lot = "0.12"
+vortex = { workspace = true, features = ["files"] }
+vortex-parquet = { path = ".." }
+
+[build-dependencies]
+cc = "1.2"
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.11"
+tar = "0.4"
+
+[dev-dependencies]
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+tempfile = "3"
+
+[[example]]
+name = "vortex_parquet"
+crate-type = ["cdylib"]
+required-features = ["loadable-extension"]
+
+[lints]
+workspace = true

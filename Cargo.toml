@@ -1,0 +1,134 @@
+[package]
+name = "vortex-parquet"
+description = "Read Apache Parquet files through the Vortex reader."
+authors = ["SpiralDB contributors"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+readme = "README.md"
+repository = "https://github.com/spiraldb/vortex-parquet"
+rust-version = "1.95"
+version = "0.1.0"
+
+[workspace]
+members = ["duckdb", "benchmarks"]
+# Stated here because the member declares `resolver = "2"` in its own manifest, where it is ignored
+# for a non-root package, and the resulting warning fails a `-D warnings` build.
+resolver = "2"
+
+# Pin all Vortex components, including the DataFusion integration, to one upstream commit.
+# Arrow 58 remains at the Parquet decoder boundary; Arrow 59 matches Vortex and DataFusion 55.
+# src/arrow_bridge.rs transfers the nested fallback through the stable Arrow C Data Interface.
+[workspace.dependencies]
+vortex-datafusion = { git = "https://github.com/vortex-data/vortex.git", rev = "c58d6237e5ae89a8fcbe6b4c1827bad4360519a7", default-features = false }
+vortex = { git = "https://github.com/vortex-data/vortex.git", rev = "c58d6237e5ae89a8fcbe6b4c1827bad4360519a7", default-features = false }
+
+[dependencies]
+# Vortex uses Arrow 59; the Parquet 58 experimental page API remains pinned.
+# Transfer nested fallback arrays through the Arrow C Data Interface.
+arrow-array = { version = "58.4", features = ["ffi"] }
+arrow-array-vortex = { package = "arrow-array", version = "59.2", features = ["ffi"] }
+arrow-schema-vortex = { package = "arrow-schema", version = "59.2" }
+arrow-schema = "58.4"
+async-trait = "0.1"
+bytes = "1"
+crc32fast = "1"
+futures = "0.3"
+memchr = "2"
+# `std::sync::Mutex` is disallowed by clippy.toml, following Vortex.
+parking_lot = "0.12"
+simdutf8 = "0.1.5"
+# `experimental` is doc-hidden and carries no semver guarantee. It is what makes the page and encoding
+# layer (`encodings::rle::RleDecoder`) reachable from outside the crate, which is what `pages.rs`
+# needs; `column::page::{Page, PageReader}` are public without it.
+#
+# Accepted knowingly, and the risk is real rather than cosmetic: a caret-compatible release may remove
+# the module, change the decoder's signature, or alter its semantics. The first two break the build,
+# which is loud. The third would be quiet — so treat a parquet bump as requiring a rerun of the
+# page-path tests, not just a green build.
+parquet = { version = "58.4", default-features = false, features = [
+    "arrow",
+    "brotli",
+    "crc",
+    "experimental",
+    "flate2-zlib-rs",
+    "lz4",
+    "snap",
+    "zstd",
+] }
+thrift = { version = "0.17", default-features = false }
+vortex = { workspace = true, features = [
+    "files",
+    "object_store",
+    "tokio",
+] }
+
+[dev-dependencies]
+arrow-array = "58.4"
+
+[lints]
+workspace = true
+
+# Copied from Vortex so code moves between the repos without being relinted.
+# See also clippy.toml, which carries the configurable half of this policy.
+[workspace.lints.rust]
+let_underscore_drop = "deny"
+macro_use_extern_crate = "deny"
+missing_docs = "deny"
+redundant_lifetimes = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+warnings = "warn"
+
+[workspace.lints.clippy]
+absolute_paths = "deny"
+all = { level = "deny", priority = -1 }
+as_ptr_cast_mut = "deny"
+borrow_as_ptr = "deny"
+cast_possible_truncation = "deny"
+clone_on_ref_ptr = "deny"
+cognitive_complexity = "deny"
+collection_is_never_read = "deny"
+dbg_macro = "deny"
+debug_assert_with_mut_call = "deny"
+derive_partial_eq_without_eq = "deny"
+equatable_if_let = "deny"
+exit = "deny"
+expect_fun_call = "deny"
+expect_used = "deny"
+fallible_impl_from = "deny"
+get_unwrap = "deny"
+host_endian_bytes = "deny"
+if_then_some_else_none = "deny"
+inconsistent_struct_constructor = "deny"
+manual_assert = "deny"
+manual_is_variant_and = "deny"
+many_single_char_names = "deny"
+mem_forget = "deny"
+multiple_crate_versions = "allow"
+needless_range_loop = "allow"
+or_fun_call = "deny"
+panic = "deny"
+redundant_clone = "deny"
+redundant_static_lifetimes = "deny"
+ref_binding_to_reference = "deny"
+ref_option = "deny"
+ref_option_ref = "deny"
+ref_patterns = "deny"
+repeat_vec_with_capacity = "deny"
+reserve_after_initialization = "deny"
+same_name_method = "deny"
+tests_outside_test_module = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+use_debug = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.bench]
+codegen-units = 16
+debug = "full"
+lto = false

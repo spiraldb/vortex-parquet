@@ -1,0 +1,49 @@
+[package]
+name = "benchmarks"
+description = "Measure where the Parquet-to-Vortex boundary should be drawn."
+authors = ["SpiralDB contributors"]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.95"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1"
+arrow-array = "59.2"
+arrow-schema = "59.2"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+# Must match the major that `vortex-datafusion` pins for the DataFusion *component* crates
+# (datafusion-catalog, -common, -datasource, ...). The umbrella crate's version does not have to
+# agree with it — a mismatch surfaces as `TableProvider is not satisfied`, because the two halves see
+# different `TableProvider` traits. Check with `cargo tree -p datafusion-catalog` after bumping
+# either this or the Vortex pin.
+datafusion = "55"
+futures = "0.3"
+# Only for `posix_fadvise(POSIX_FADV_DONTNEED)`, which evicts one file from the page cache without
+# root — unlike `drop_caches`, which needs root and would evict everything else on the box too.
+libc = "0.2"
+# The `gcp` feature is what provides `GoogleCloudStorageBuilder`; the crate itself is already in the
+# tree via vortex and datafusion, so this enables a backend rather than adding a dependency.
+object_store = { version = "0.13", features = ["gcp"] }
+# Only for the `--recompress` mode, which rewrites a file with a different codec so the codec can be
+# treated as a variable rather than a property of the format.
+parquet = { version = "59.2", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+] }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+vortex = { workspace = true, features = [
+    "files",
+    "object_store",
+    "tokio",
+] }
+vortex-datafusion = { workspace = true }
+vortex-parquet = { path = ".." }
+
+[lints]
+workspace = true

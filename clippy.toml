@@ -1,0 +1,36 @@
+# Derived from vortex/clippy.toml, keeping the parts that apply to a downstream consumer of Vortex.
+#
+# Dropped from the original: `disallowed-methods` entries policing Vortex's own internals
+# (`vortex_session::registry::Id::new`, `vortex_array::legacy_session`) — those are rules for people
+# editing Vortex, not for people calling it.
+
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+absolute-paths-max-segments = 3
+single-char-binding-names-threshold = 2
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use the HashMap in vortex::utils::aliases::hash_map for better performance" },
+    { path = "std::collections::HashSet", reason = "Use the HashSet in vortex::utils::aliases::hash_set for better performance" },
+    { path = "std::sync::Mutex", reason = "Prefer using parking_lot Mutex for improved ergonomics and performance" },
+    { path = "std::sync::RwLock", reason = "Prefer using parking_lot RwLock for improved ergonomics and performance" },
+]
+
+# The `ToCanonical` methods are deprecated upstream because they cannot take an `ExecutionCtx`. They
+# still resolve, so an adapter can reach for them by accident; `allow-invalid` keeps these entries
+# harmless if upstream removes them outright.
+disallowed-methods = [
+    { path = "vortex_array::ToCanonical::to_null", reason = "This function doesn't take the context, use `array.execute::<NullArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_bool", reason = "This function doesn't take the context, use `array.execute::<BoolArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_primitive", reason = "This function doesn't take the context, use `array.execute::<PrimitiveArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_decimal", reason = "This function doesn't take the context, use `array.execute::<DecimalArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_struct", reason = "This function doesn't take the context, use `array.execute::<StructArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_listview", reason = "This function doesn't take the context, use `array.execute::<ListViewArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_fixed_size_list", reason = "This function doesn't take the context, use `array.execute::<FixedSizeListArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_varbinview", reason = "This function doesn't take the context, use `array.execute::<VarBinViewArray>(ctx)` instead", allow-invalid = true },
+    { path = "vortex_array::ToCanonical::to_extension", reason = "This function doesn't take the context, use `array.execute::<ExtensionArray>(ctx)` instead", allow-invalid = true },
+    { path = "std::thread::available_parallelism", reason = "This function might do an unbounded amount of work; use `vortex::utils::parallelism::get_available_parallelism` instead" },
+    { path = "std::result::Result::and", reason = "This method is a footgun, especially when working with `Result<Validity>`." },
+]

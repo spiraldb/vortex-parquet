@@ -1,0 +1,28 @@
+# From vortex/_typos.toml. The identifier allowlist is inherited because this repo's prose discusses
+# the same encodings Vortex does; the special comments are inherited so a hint written in one repo
+# means the same thing in the other.
+[default]
+# `Trafic` and `Artifical` are ClickBench's own column names, misspelled in the published schema
+# (`TraficSourceID`, `IsArtifical`). The queries must match the data, so these are not ours to fix --
+# "correcting" either one produces a query that cannot bind.
+extend-ignore-identifiers-re = [
+    "ffor",
+    "FFOR",
+    "FoR",
+    "typ",
+    "wht",
+    "WHT",
+    "Trafic",
+    "Artifical",
+]
+# We support a few common special comments to tell the checker to ignore sections of code
+extend-ignore-re = [
+    "(#|//)\\s*spellchecker:ignore-next-line\\n.*", # Ignore the next line
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$", # Ignore line that ends with this hint
+    "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on", # Ignore block between hints
+]
+
+# The vendored TPC query SQL is copied verbatim and must stay byte-identical to the specification's
+# text, typos included -- "correcting" a query is how two runs stop comparing the same workload.
+[files]
+extend-exclude = ["benchmarks/tpc-sql/"]

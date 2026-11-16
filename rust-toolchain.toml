@@ -1,0 +1,11 @@
+# Matches vortex/rust-toolchain.toml exactly. This crate compiles against a pinned Vortex develop commit, so
+# it should compile with the toolchain that commit was built and tested with — a newer compiler
+# can accept code that Vortex's own CI would reject.
+#
+# `rustfmt.toml` uses unstable options, so formatting needs a nightly on top of this pin — the same
+# pinned nightly Vortex uses (`NIGHTLY_TOOLCHAIN` in its own CI workflow). This repo has no CI, so
+# nothing enforces that automatically; see README's Development section for the command.
+[toolchain]
+channel = "1.100.0"
+components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]
+profile = "minimal"
