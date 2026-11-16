@@ -48,6 +48,7 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
+use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ChunkedArray;
 use vortex::array::arrays::Dict;
@@ -2431,4 +2432,51 @@ fn a_sparse_page_range_over_a_nested_column_uses_its_row_group_indexes() {
             "nested page-range decode fetched the complete chunk {nested_chunk:?}: {data_reads:?}"
         );
     })
+}
+
+#[test]
+fn successive_filters_reuse_the_loaded_column() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = write_parquet(&flat_table_n(64), 64);
+        let format = ParquetFormat::new().with_cache_policy(CachePolicy::Bounded(1 << 20));
+        let reader = format
+            .open(FileHandle::new(
+                Arc::new(bytes.clone()),
+                bytes.len() as u64,
+                session.clone(),
+            ))
+            .await
+            .unwrap();
+        let first = gt_eq(get_item("id", root()), lit(62i64))
+            .bind(reader.dtype())
+            .unwrap();
+        let selected = reader
+            .filter_evaluation(&(0..64), &first, MaskFuture::ready(Mask::new_true(64)))
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(
+            (0..64)
+                .filter(|&row| selected.value(row))
+                .collect::<Vec<_>>(),
+            vec![62, 63]
+        );
+        let second = gt_eq(get_item("id", root()), lit(63i64))
+            .bind(reader.dtype())
+            .unwrap();
+        let selected = reader
+            .filter_evaluation(&(0..64), &second, MaskFuture::ready(selected))
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(
+            (0..64)
+                .filter(|&row| selected.value(row))
+                .collect::<Vec<_>>(),
+            vec![63]
+        );
+        assert_eq!(format.metrics().snapshot().page_decodes, 1);
+        assert_eq!(format.metrics().snapshot().selective_decodes, 0);
+    });
 }
