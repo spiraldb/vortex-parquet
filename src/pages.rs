@@ -37,6 +37,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
 use std::mem::MaybeUninit;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::OnceLock;
@@ -518,7 +519,7 @@ impl PlainI16Page {
     /// On error its contents are unspecified; values outside the requested range are not decoded.
     pub fn decode_range_into(
         &self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         output: &mut [MaybeUninit<i16>],
     ) -> VortexResult<()> {
         vortex_ensure!(
@@ -1126,7 +1127,7 @@ pub(crate) fn decode_selected_chunk(
     row_count: u64,
     all_locations: &[PageLocation],
     selected_locations: Vec<PageLocation>,
-    row_range: &std::ops::Range<usize>,
+    row_range: &Range<usize>,
     mask: &Mask,
     options: ReaderOptions,
     metrics: Arc<ScanMetrics>,
@@ -1158,6 +1159,17 @@ pub(crate) fn decode_selected_chunk(
     else {
         return Ok(None);
     };
+
+    if can_reuse_chunk_mask(
+        all_locations,
+        &selected_locations,
+        row_range,
+        total_rows,
+        mask.len(),
+        array.len(),
+    ) {
+        return Ok(Some(filter_page_chunks(array, mask.clone())?));
+    }
 
     let mut selected = BitBufferMut::with_capacity(array.len());
     for location in &selected_locations {
@@ -1226,6 +1238,32 @@ pub(crate) fn filter_page_chunks(array: ArrayRef, mask: Mask) -> VortexResult<Ar
     Ok(ChunkedArray::try_new(chunks, array.dtype().clone())?.into_array())
 }
 
+/// All pages in their original row order use the original whole-chunk row mask.
+#[allow(deprecated)]
+fn can_reuse_chunk_mask(
+    all_locations: &[PageLocation],
+    selected_locations: &[PageLocation],
+    row_range: &Range<usize>,
+    total_rows: usize,
+    mask_len: usize,
+    array_len: usize,
+) -> bool {
+    row_range == &(0..total_rows)
+        && mask_len == total_rows
+        && array_len == total_rows
+        && selected_locations == all_locations
+        && all_locations
+            .first()
+            .is_some_and(|first| first.first_row_index == 0)
+        && all_locations.last().is_some_and(|last| {
+            usize::try_from(last.first_row_index).is_ok_and(|row| row <= total_rows)
+        })
+        && all_locations.windows(2).all(|pages| {
+            pages[0].offset < pages[1].offset
+                && pages[0].first_row_index <= pages[1].first_row_index
+        })
+}
+
 /// Decodes sparse flat-column records directly into Vortex buffers.
 ///
 /// This is the no-offset-index counterpart of [`decode_selected_chunk`]. It cannot avoid fetching
@@ -1238,7 +1276,7 @@ pub(crate) fn decode_selected_records(
     descriptor: &ColumnDescPtr,
     dtype: &DType,
     row_count: u64,
-    row_range: &std::ops::Range<usize>,
+    row_range: &Range<usize>,
     mask: &Mask,
 ) -> VortexResult<Option<ArrayRef>> {
     if descriptor.max_rep_level() != 0
@@ -1346,7 +1384,7 @@ type SelectedRecords<T> = (Vec<T>, Option<Vec<bool>>);
 fn read_selected_records<T: ParquetDataType>(
     mut reader: ColumnReaderImpl<T>,
     descriptor: &ColumnDescPtr,
-    row_range: &std::ops::Range<usize>,
+    row_range: &Range<usize>,
     mask: &Mask,
 ) -> VortexResult<SelectedRecords<T::T>> {
     let selected = mask.true_count();
