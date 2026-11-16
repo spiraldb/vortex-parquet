@@ -649,6 +649,17 @@ macro_rules! parquet_page_encoding {
                 array: Array<Self>,
                 ctx: &mut ExecutionCtx,
             ) -> VortexResult<ExecutionResult> {
+                if matches!(array.dtype(), DType::Utf8(_) | DType::Binary(_))
+                    && let Some(values) = binary_dictionary_values(array.data())?
+                {
+                    let codes = decode_dictionary_codes(array.data(), values.len())?;
+                    let dictionary = DictArray::try_new(codes, values)?.into_array();
+                    return Ok(ExecutionResult::done(materialize_dictionary_bytes(
+                        dictionary,
+                        array.dtype(),
+                        ctx,
+                    )?));
+                }
                 Ok(ExecutionResult::done(decode_page_parts(
                     array.data(),
                     array.dtype(),
@@ -2536,6 +2547,65 @@ where
         previous_end = end;
     }
     Ok((decoded, selected_validity))
+}
+
+/// Returns a dictionary's binary payload without decoding codes or validating unreferenced text.
+fn binary_dictionary_values(data: &ParquetPageData) -> VortexResult<Option<ArrayRef>> {
+    if data.page.is_dictionary_page()
+        || data.descriptor.physical_type() != PhysicalType::BYTE_ARRAY
+        || !matches!(
+            data.encoding(),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+        )
+    {
+        return Ok(None);
+    }
+    let Some(source) = data.dictionary_values.as_ref() else {
+        return Ok(None);
+    };
+    if matches!(source.dtype(), DType::Binary(_)) {
+        return Ok(Some(source.clone()));
+    }
+    let Some(page) = source.as_opt::<ParquetPlain>() else {
+        return Ok(None);
+    };
+    if !page.data().page.is_dictionary_page() {
+        return Ok(None);
+    }
+    // A Parquet dictionary page contains bytes regardless of its field's logical string type.
+    // Relabel only this known page representation, without executing a fallible UTF-8 cast.
+    Ok(Some(
+        Array::try_from_parts(ArrayParts::new(
+            ParquetPlain,
+            DType::Binary(page.dtype().nullability()),
+            page.len(),
+            page.data().clone(),
+            page.slots().iter().cloned().collect::<ArraySlots>(),
+        ))?
+        .into_array(),
+    ))
+}
+
+/// Gathers dictionary views before validating the selected logical string values.
+fn materialize_dictionary_bytes(
+    dictionary: ArrayRef,
+    dtype: &DType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let gathered = dictionary.execute::<VarBinViewArray>(ctx)?;
+    if matches!(dtype, DType::Binary(_)) {
+        return Ok(gathered.into_array());
+    }
+    // Only dictionary entries referenced by this page's nonnull codes are checked as UTF-8.
+    let parts = gathered.into_data_parts();
+    let views = Buffer::<BinaryView>::from_byte_buffer(parts.views.as_host().clone());
+    let buffers = parts
+        .buffers
+        .iter()
+        .map(|buffer| buffer.as_host().clone())
+        .collect::<Vec<_>>()
+        .into();
+    Ok(VarBinViewArray::try_new(views, buffers, dtype.clone(), parts.validity, ctx)?.into_array())
 }
 
 /// Reduces a Parquet dictionary page to Vortex's native dictionary representation.

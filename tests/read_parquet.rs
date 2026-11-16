@@ -40,9 +40,13 @@ use parking_lot::Mutex;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
+use parquet::data_type::ByteArray;
+use parquet::data_type::ByteArrayType;
 use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 use parquet::file::properties::WriterVersion;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 use parquet::thrift::TSerializable;
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
@@ -1148,6 +1152,87 @@ fn mixed_dictionary_and_plain_pages_share_native_dictionary_values() {
                 .depth_first_traversal()
                 .any(|array| array.encoding_id().as_ref().starts_with("vortex.parquet.")),
             "plain pages in a mixed chunk should remain Parquet page arrays"
+        );
+    })
+}
+
+/// Returns two dictionary data pages sharing a UTF-8 dictionary with one invalid entry.
+async fn string_dictionary_pages(session: &VortexSession) -> Vec<ArrayRef> {
+    let schema =
+        Arc::new(parse_message_type("message test { OPTIONAL BYTE_ARRAY value (UTF8); }").unwrap());
+    let properties = Arc::new(
+        WriterProperties::builder()
+            .set_data_page_row_count_limit(2)
+            .set_write_batch_size(2)
+            .set_dictionary_enabled(true)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build(),
+    );
+    let mut bytes = Vec::new();
+    let mut writer = SerializedFileWriter::new(&mut bytes, schema, properties).unwrap();
+    let mut group = writer.next_row_group().unwrap();
+    let mut values = group.next_column().unwrap().unwrap();
+    values
+        .typed::<ByteArrayType>()
+        .write_batch(
+            &[
+                ByteArray::from(b"valid-abcdefghijkl".to_vec()),
+                ByteArray::from(vec![0xff; 20]),
+            ],
+            Some(&[1, 0, 1, 0]),
+            None,
+        )
+        .unwrap();
+    values.close().unwrap();
+    group.close().unwrap();
+    writer.close().unwrap();
+    let reader = open(session, ByteBuffer::copy_from(bytes)).await.unwrap();
+    let result = scan(session, reader, None).await.unwrap();
+    let pages = result
+        .depth_first_traversal()
+        .filter(|array| array.is::<ParquetRleDictionary>())
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2);
+    pages
+}
+
+#[test]
+fn dictionary_string_materialization_ignores_unreferenced_invalid_utf8() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let pages = string_dictionary_pages(&session).await;
+        let actual = pages[0]
+            .clone()
+            .execute::<Canonical>(&mut session.create_execution_ctx())
+            .unwrap()
+            .into_array();
+        let expected = session
+            .arrow()
+            .from_arrow_array(
+                arrow_bridge::import_array(&StringArray::from(vec![
+                    Some("valid-abcdefghijkl"),
+                    None,
+                ]))
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(render(&actual, &session), render(&expected, &session));
+    })
+}
+
+#[test]
+fn dictionary_string_materialization_rejects_referenced_invalid_utf8() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let pages = string_dictionary_pages(&session).await;
+        let error = pages[1]
+            .clone()
+            .execute::<Canonical>(&mut session.create_execution_ctx())
+            .unwrap_err();
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("utf"),
+            "{error}"
         );
     })
 }
