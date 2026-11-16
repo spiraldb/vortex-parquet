@@ -3,7 +3,6 @@
 //! End-to-end tests over real Parquet files.
 
 #![expect(clippy::tests_outside_test_module)]
-#![expect(clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -12,6 +11,7 @@ use std::sync::atomic::Ordering;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::BinaryArray;
 use arrow_array::Decimal64Array;
+use arrow_array::Decimal128Array;
 use arrow_array::Float32Array;
 use arrow_array::Float64Array;
 use arrow_array::Int8Array;
@@ -32,6 +32,7 @@ use arrow_array_vortex::BooleanArray;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Fields;
+use arrow_schema::SchemaRef;
 use arrow_schema_vortex::Field as VortexArrowField;
 use futures::FutureExt;
 use futures::TryStreamExt;
@@ -51,9 +52,12 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
+use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ChunkedArray;
+use vortex::array::arrays::Decimal;
 use vortex::array::arrays::Dict;
+use vortex::array::arrays::decimal::DecimalArrayExt;
 use vortex::array::buffer::BufferHandle;
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::optimizer::ArrayOptimizer;
@@ -69,6 +73,7 @@ use vortex::buffer::Alignment;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
+use vortex::dtype::DecimalType;
 use vortex::dtype::FieldMask;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
@@ -106,14 +111,19 @@ use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
+use vortex_parquet::OpenedParquetFile;
 use vortex_parquet::ParquetFormat;
 use vortex_parquet::cache::CachePolicy;
 use vortex_parquet::file::FileHandle;
+use vortex_parquet::hierarchy::PageSetData;
 use vortex_parquet::hierarchy::ParquetColumnChunk;
 use vortex_parquet::hierarchy::ParquetFile;
 use vortex_parquet::hierarchy::ParquetHeaderPages;
 use vortex_parquet::hierarchy::ParquetIndexedPages;
 use vortex_parquet::hierarchy::ParquetRowGroup;
+use vortex_parquet::hierarchy::header_pages_layout;
+use vortex_parquet::layout::FileContext;
+use vortex_parquet::layout::PageExecutionData;
 use vortex_parquet::layout::ParquetField;
 use vortex_parquet::options::ReaderOptions;
 use vortex_parquet::pages::ParquetBitPacked;
@@ -125,6 +135,7 @@ use vortex_parquet::pages::ParquetPlain;
 use vortex_parquet::pages::ParquetPlainDictionary;
 use vortex_parquet::pages::ParquetRle;
 use vortex_parquet::pages::ParquetRleDictionary;
+use vortex_parquet::segments::SegmentTable;
 
 fn flat_table() -> RecordBatch {
     flat_table_n(40)
@@ -266,10 +277,19 @@ fn write_parquet_with_properties(batch: &RecordBatch, properties: WriterProperti
 
 /// Writes two data pages with INT64 decimal storage independently of the declared precision.
 fn small_precision_decimal_file(values: &[i64], levels: &[i16], dictionary: bool) -> ByteBuffer {
+    integer_decimal_file(2, values, levels, dictionary)
+}
+
+fn integer_decimal_file(
+    precision: u8,
+    values: &[i64],
+    levels: &[i16],
+    dictionary: bool,
+) -> ByteBuffer {
     let schema = Arc::new(
-        parse_message_type(
-            "message test { REQUIRED INT64 id; OPTIONAL INT64 amount (DECIMAL(2,0)); }",
-        )
+        parse_message_type(&format!(
+            "message test {{ REQUIRED INT64 id; OPTIONAL INT64 amount (DECIMAL({precision},0)); }}"
+        ))
         .unwrap(),
     );
     let properties = Arc::new(
@@ -322,14 +342,79 @@ async fn read_materialized_amounts(
 }
 
 fn assert_amounts(actual: &ArrayRef, expected: &[Option<i64>], session: &VortexSession) {
+    assert_amounts_with_precision(actual, expected, 2, session);
+}
+
+fn assert_amounts_with_precision(
+    actual: &ArrayRef,
+    expected: &[Option<i64>],
+    precision: u8,
+    session: &VortexSession,
+) {
     let expected = Decimal64Array::from(expected.to_vec())
-        .with_precision_and_scale(2, 0)
+        .with_precision_and_scale(precision, 0)
         .unwrap();
     let expected = session
         .arrow()
         .from_arrow_array(arrow_bridge::import_array(&expected).unwrap(), true)
         .unwrap();
     assert_eq!(render(actual, session), render(&expected, session));
+}
+
+fn file_context(opened: &OpenedParquetFile) -> Arc<FileContext> {
+    let groups = opened.layout.slot(0).unwrap().unwrap();
+    let group = groups.slot(0).unwrap().unwrap();
+    let fields = group.slot(0).unwrap().unwrap();
+    let field = fields.slot(1).unwrap().unwrap();
+    Arc::clone(&field.as_::<ParquetField>().data().ctx)
+}
+
+fn physical_reader(
+    opened: &OpenedParquetFile,
+    column: usize,
+    session: &VortexSession,
+) -> (LayoutReaderRef, SchemaRef) {
+    let context = file_context(opened);
+    let group = context.metadata.row_group(0);
+    let row_count = u64::try_from(group.num_rows()).unwrap();
+    let (byte_offset, byte_length) = group.column(column).byte_range();
+    let dtype = opened
+        .layout
+        .dtype()
+        .as_struct_fields()
+        .field_by_index(column)
+        .unwrap();
+    let mut segments = SegmentTable::new();
+    let id = segments
+        .push(byte_offset..byte_offset + byte_length)
+        .unwrap();
+    let source = context.file.segment_source(segments).unwrap();
+    let data = PageExecutionData {
+        ctx: context,
+        row_group: 0,
+        root_column: column,
+        byte_offset,
+        byte_length,
+        offset_indexes: vec![],
+        column_indexes: vec![],
+        bloom_filters: vec![],
+    };
+    let decoder_schema = Arc::clone(data.decode_inputs().arrow_metadata.schema());
+    let reader = header_pages_layout(
+        dtype,
+        row_count,
+        vec![id],
+        PageSetData {
+            chunk_range: byte_offset..byte_offset + byte_length,
+            offset_index: None,
+            column_index: None,
+            bloom_filter: None,
+            execution: data,
+        },
+    )
+    .new_reader("physical".into(), source, session, &Default::default())
+    .unwrap();
+    (reader, decoder_schema)
 }
 
 #[derive(Clone)]
@@ -2611,5 +2696,138 @@ fn a_sparse_page_range_over_a_nested_column_uses_its_row_group_indexes() {
             bytes_read < nested_chunk.end - nested_chunk.start,
             "nested page-range decode fetched the complete chunk {nested_chunk:?}: {data_reads:?}"
         );
+    })
+}
+#[test]
+fn int64_decimal_hint_keeps_public_schema_and_nulls() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = integer_decimal_file(15, &[12, 34, 56], &[1, 1, 0, 1], true);
+        let size = bytes.len() as u64;
+        let format = ParquetFormat::new()
+            .with_options(ReaderOptions::default().with_materialized_projections());
+        let opened = format
+            .open_file(FileHandle::new(Arc::new(bytes), size, session.clone()))
+            .await
+            .unwrap();
+        let context = file_context(&opened);
+        assert_eq!(
+            context.arrow_metadata.schema().field(1).data_type(),
+            &DataType::Decimal128(15, 0)
+        );
+        assert_eq!(
+            context.decoder_metadata.schema().field(1).data_type(),
+            &DataType::Decimal64(15, 0)
+        );
+        let source = format
+            .open_data_source_with_metadata(context.file.clone(), Arc::clone(&context.metadata))
+            .unwrap();
+        let stats = source
+            .field_statistics(&FieldPath::from_name("amount"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats
+                .get_as::<u64>(
+                    Stat::UncompressedSizeInBytes,
+                    &DType::Primitive(PType::U64, Nullability::NonNullable)
+                )
+                .as_exact(),
+            Some(4 * 16)
+        );
+        let (reader, decoder_schema) = physical_reader(&opened, 1, &session);
+        assert_eq!(
+            decoder_schema.field(1).data_type(),
+            &DataType::Decimal64(15, 0)
+        );
+        let projection = root().bind(reader.dtype()).unwrap();
+        let actual = reader
+            .projection_evaluation(&(0..4), &projection, MaskFuture::ready(Mask::new_true(4)))
+            .unwrap()
+            .await
+            .unwrap();
+        let decoded = actual
+            .execute_until::<Decimal>(&mut session.create_execution_ctx())
+            .unwrap();
+        assert_eq!(decoded.as_::<Decimal>().values_type(), DecimalType::I64);
+        assert_amounts_with_precision(
+            &decoded,
+            &[Some(12), Some(34), None, Some(56)],
+            15,
+            &session,
+        );
+        assert!(format.metrics().snapshot().arrow_decodes > 0);
+    })
+}
+
+#[test]
+fn int32_decimal_hint_keeps_public_schema_and_scale() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let values = Decimal128Array::from(vec![Some(12_i128), None, Some(34)])
+            .with_precision_and_scale(7, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("amount", Arc::new(values) as ArrowArrayRef)]).unwrap();
+        let bytes = write_parquet(&batch, 3);
+        let size = bytes.len() as u64;
+        let format = ParquetFormat::new()
+            .with_options(ReaderOptions::default().with_materialized_projections());
+        let opened = format
+            .open_file(FileHandle::new(Arc::new(bytes), size, session.clone()))
+            .await
+            .unwrap();
+        let context = file_context(&opened);
+        assert_eq!(
+            context.arrow_metadata.schema().field(0).data_type(),
+            &DataType::Decimal128(7, 2)
+        );
+        assert_eq!(
+            context.decoder_metadata.schema().field(0).data_type(),
+            &DataType::Decimal32(7, 2)
+        );
+        let actual = scan(&session, opened.reader, None).await.unwrap();
+        assert_eq!(
+            render(&actual, &session),
+            render(&reference(&batch), &session)
+        );
+    })
+}
+
+#[test]
+fn decimal_hint_checks_selected_precision() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = integer_decimal_file(
+            15,
+            &[12, 34, 1_000_000_000_000_000_i64, 56],
+            &[1, 1, 1, 1],
+            true,
+        );
+        let error = read_materialized_amounts(&session, bytes, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("precision"), "{error}");
+    })
+}
+
+#[test]
+fn decimal_hint_ignores_rejected_precision_overflow() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let bytes = integer_decimal_file(
+            15,
+            &[12, 34, 1_000_000_000_000_000_i64, 56],
+            &[1, 1, 1, 1],
+            true,
+        );
+        let actual = read_materialized_amounts(
+            &session,
+            bytes,
+            Some(not_eq(get_item("id", root()), lit(2_i64))),
+        )
+        .await
+        .unwrap();
+        assert_amounts_with_precision(&actual, &[Some(12), Some(34), Some(56)], 15, &session);
     })
 }
