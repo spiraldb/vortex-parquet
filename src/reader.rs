@@ -475,11 +475,11 @@ impl CachedDecode {
         row_range: &Range<usize>,
         mask: &Mask,
     ) -> VortexResult<bool> {
-        // Every page is needed when the whole row group is selected. Avoid reading an offset
-        // index (or walking page headers) merely to rediscover that fact.
-        if mask.all_true()
-            && row_range.start == 0
-            && u64::try_from(row_range.end)? == self.row_count
+        // Sparse decoding can discover headers later; a dense-cost probe need not.
+        if self.inputs.offset_indexes.is_empty()
+            || (mask.all_true()
+                && row_range.start == 0
+                && u64::try_from(row_range.end)? == self.row_count)
         {
             return Ok(false);
         }
@@ -1100,12 +1100,7 @@ fn selected_page_ranges(
             }
             let local_start = usize::try_from(overlap_start)? - row_range.start;
             let local_end = usize::try_from(overlap_end)? - row_range.start;
-            if !mask
-                .iter()
-                .skip(local_start)
-                .take(local_end - local_start)
-                .any(|v| v)
-            {
+            if mask.slice(local_start..local_end).all_false() {
                 continue;
             }
 
@@ -1571,7 +1566,8 @@ impl LayoutReader for ParquetPageSetReader {
             if mask.all_false() {
                 return Ok(mask);
             }
-            if !decode.logical_is_decimal()
+            if full.peek().is_none()
+                && !decode.logical_is_decimal()
                 && !mask.all_true()
                 && (mask.density() < threshold
                     || decode.skips_indexed_page(&row_range, &mask).await?)
@@ -1830,7 +1826,8 @@ impl LayoutReader for ParquetFieldReader {
             if mask.all_false() {
                 return Ok(mask);
             }
-            if !decode.logical_is_decimal()
+            if full.peek().is_none()
+                && !decode.logical_is_decimal()
                 && !mask.all_true()
                 && (mask.density() < threshold
                     || decode.skips_indexed_page(&row_range, &mask).await?)
