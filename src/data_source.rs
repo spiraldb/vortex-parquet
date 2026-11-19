@@ -12,7 +12,10 @@ use std::task::Poll;
 use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
+use futures::future;
 use futures::stream;
+use futures::stream::BoxStream;
+use parking_lot::Mutex;
 use vortex::array::ArrayRef;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ConstantArray;
@@ -32,23 +35,17 @@ use vortex::error::vortex_bail;
 use vortex::expr::BoundExpression;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
-use vortex::expr::referenced_field_paths;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
-use vortex::expr::traversal::TraversalOrder;
-use vortex::expr::traversal::pre_order_visit_down;
-use vortex::layout::LayoutReaderRef;
-use vortex::layout::scan::repeated_scan::RepeatedScan;
-use vortex::layout::scan::scan_builder::ScanBuilder;
-use vortex::layout::scan::split_by::SplitBy;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
+use vortex::layout::scan::v2::ScanFile;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::scalar_fn::fns::literal::Literal;
 use vortex::scalar_fn::fns::operators::CompareOperator;
 use vortex::scalar_fn::fns::operators::Operator;
-use vortex::scalar_fn::fns::select::FieldSelection;
-use vortex::scalar_fn::fns::select::Select;
 use vortex::scan::DataSource;
 use vortex::scan::DataSourceScan;
 use vortex::scan::DataSourceScanRef;
@@ -56,9 +53,11 @@ use vortex::scan::Partition;
 use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
+use vortex::scan::execution::driver::ScanDriver;
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
+use vortex::utils::parallelism::get_available_parallelism;
 
 use crate::PreparedFile;
 use crate::pages::single_leaf_index;
@@ -71,6 +70,13 @@ pub(crate) struct ParquetDataSource {
     session: VortexSession,
     dtype: DType,
     row_groups: Arc<[Range<u64>]>,
+    /// The file's layout, segment table and placed reader, built by the first scan.
+    ///
+    /// Built once and shared by every scan, because the segment ids in the layout must index the
+    /// same table every time: the session's I/O scheduler keeps one registration per placed
+    /// reader, with the locations it was first registered with. Its plan cache is `None`, so plans
+    /// are lowered per partition and a row group's decodes are released when its partition ends.
+    file: Mutex<Option<ScanFile>>,
 }
 
 impl ParquetDataSource {
@@ -96,7 +102,20 @@ impl ParquetDataSource {
             dtype: prepared.dtype.clone(),
             prepared,
             row_groups: row_groups.into(),
+            file: Mutex::new(None),
         })
+    }
+
+    /// The file's scan inputs, built on first use. Building them visits every column chunk in
+    /// the footer, which binding the source does not need to pay for.
+    fn scan_file(&self) -> VortexResult<ScanFile> {
+        let mut file = self.file.lock();
+        if let Some(scan_file) = &*file {
+            return Ok(scan_file.clone());
+        }
+        let scan_file = crate::scan_file(&self.prepared)?;
+        *file = Some(scan_file.clone());
+        Ok(scan_file)
     }
 
     /// Drop only static comparisons proven true for every row, including null rows. Doing this
@@ -378,72 +397,19 @@ impl DataSource for ParquetDataSource {
             scan_request.filter = self.unsatisfied_filter(filter, &mut HashMap::new())?;
         }
 
-        let fields = self
-            .dtype
-            .as_struct_fields_opt()
-            .ok_or_else(|| vortex::error::vortex_err!("Parquet root must be a struct"))?;
-        let mut selected = vec![false; fields.nfields()];
-        for expression in
-            std::iter::once(&scan_request.projection).chain(scan_request.filter.iter())
-        {
-            let bound = expression.bind(&self.dtype)?;
-            let mut paths = referenced_field_paths(&bound)?;
-            // A projection's intermediate Select nodes still need their named fields to exist
-            // when rebound to the reduced scope, even if an outer GetItem narrows its output.
-            pre_order_visit_down(&bound, |node| {
-                if let Some(selection) = node.as_opt::<Select>() {
-                    let scope = match selection {
-                        FieldSelection::Include(_) => node,
-                        FieldSelection::Exclude(_) => node.child(0),
-                    };
-                    paths.extend(referenced_field_paths(scope)?);
-                }
-                Ok(TraversalOrder::Continue)
-            })?;
-            for path in paths {
-                if path.is_root() {
-                    selected.fill(true);
-                    break;
-                }
-                let index = path
-                    .parts()
-                    .first()
-                    .and_then(|field| field.as_name())
-                    .and_then(|name| fields.find(name))
-                    .ok_or_else(|| vortex::error::vortex_err!("unknown projected field {path}"))?;
-                selected[index] = true;
-            }
-        }
-        let reader = crate::open_prepared(&self.prepared, Some(&selected))?.reader;
-        // Bind once in the projected file scope. Sharing these tree identities across row groups
-        // lets layout readers reuse their expression analysis instead of rebuilding it per split.
-        let projection = scan_request.projection.bind(reader.dtype())?;
+        let parts = self.scan_file()?;
+        // Bound once in the file scope and shared by every row group's scan. Optimized as Vortex's
+        // own data sources do: engines hand over expressions over their projected row, such as
+        // DataFusion's `pack(id: $.id).id >= 4000`, and zone pruning only sees through the
+        // simplified `$.id >= 4000`.
+        let projection = scan_request
+            .projection
+            .bind(&self.dtype)?
+            .optimize_recursive()?;
         let filter = scan_request
             .filter
-            .map(|filter| filter.bind(reader.dtype()))
+            .map(|filter| filter.bind(&self.dtype)?.optimize_recursive())
             .transpose()?;
-        // Preparation rewrites predicates and computes their referenced fields. Reuse the
-        // prepared tree too, so those rewrites do not defeat identity-based layout caches.
-        // Limited partitions retain their individual budgets below.
-        let prepared_scan = if scan_request.limit.is_none() {
-            let boundaries = self
-                .row_groups
-                .iter()
-                .map(|range| range.start)
-                .chain(std::iter::once(total_rows))
-                .collect::<Vec<_>>();
-            Some(Arc::new(
-                ScanBuilder::new(self.session.clone(), Arc::clone(&reader))
-                    .with_selection(scan_request.selection.clone())
-                    .with_projection(projection.clone())
-                    .with_some_filter(filter.clone())
-                    .with_ordered(scan_request.ordered)
-                    .with_natural_splits(boundaries.into())
-                    .prepare()?,
-            ))
-        } else {
-            None
-        };
 
         let partition_domain = 0..u64::try_from(self.row_groups.len())?;
         let partition_range = scan_request.partition_range.as_ref().map_or_else(
@@ -466,9 +432,15 @@ impl DataSource for ParquetDataSource {
                 intersect(row_group, &requested).map(|range| (idx, range))
             })
             .collect::<Vec<_>>();
+        // The driver's limit is per worker thread; a request's is for the whole partition.
+        let concurrency = scan_request.split_concurrency.map_or(1, |splits| {
+            splits
+                .get()
+                .div_ceil(get_available_parallelism().unwrap_or(1))
+                .max(1)
+        });
         Ok(Box::new(RowGroupScan {
-            prepared_scan,
-            reader,
+            parts,
             session: self.session.clone(),
             dtype,
             projection,
@@ -476,6 +448,7 @@ impl DataSource for ParquetDataSource {
             limit: scan_request.limit,
             selection: scan_request.selection,
             ordered: scan_request.ordered,
+            concurrency,
             row_groups,
             next: 0,
         }))
@@ -499,8 +472,7 @@ fn intersect(left: &Range<u64>, right: &Range<u64>) -> Option<Range<u64>> {
 }
 
 struct RowGroupScan {
-    prepared_scan: Option<Arc<RepeatedScan<ArrayRef>>>,
-    reader: LayoutReaderRef,
+    parts: ScanFile,
     session: VortexSession,
     dtype: DType,
     projection: BoundExpression,
@@ -508,6 +480,7 @@ struct RowGroupScan {
     limit: Option<u64>,
     selection: Selection,
     ordered: bool,
+    concurrency: usize,
     row_groups: Vec<(usize, Range<u64>)>,
     next: usize,
 }
@@ -543,8 +516,7 @@ impl Stream for RowGroupScan {
             *limit = limit.saturating_sub(selected_rows);
         }
         Poll::Ready(Some(Ok(Box::new(RowGroupPartition {
-            prepared_scan: self.prepared_scan.clone(),
-            reader: Arc::clone(&self.reader),
+            parts: self.parts.clone(),
             session: self.session.clone(),
             dtype: self.dtype.clone(),
             projection: self.projection.clone(),
@@ -552,6 +524,7 @@ impl Stream for RowGroupScan {
             limit: split_limit,
             selection: self.selection.clone(),
             ordered: self.ordered,
+            concurrency: self.concurrency,
             row_group,
             row_range,
         }))))
@@ -563,9 +536,9 @@ impl Stream for RowGroupScan {
     }
 }
 
+/// One row group, scanned through the V2 plan its layout lowers to.
 struct RowGroupPartition {
-    prepared_scan: Option<Arc<RepeatedScan<ArrayRef>>>,
-    reader: LayoutReaderRef,
+    parts: ScanFile,
     session: VortexSession,
     dtype: DType,
     projection: BoundExpression,
@@ -573,6 +546,7 @@ struct RowGroupPartition {
     limit: Option<u64>,
     selection: Selection,
     ordered: bool,
+    concurrency: usize,
     row_group: usize,
     row_range: Range<u64>,
 }
@@ -601,28 +575,47 @@ impl Partition for RowGroupPartition {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
-        if let Some(prepared) = self.prepared_scan {
-            return Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
-                self.dtype,
-                prepared.execute_stream(Some(self.row_range))?,
-            )));
-        }
-        let row_count = usize::try_from(self.row_range.end - self.row_range.start)?;
-        let builder = ScanBuilder::new(self.session, self.reader)
-            .with_row_range(self.row_range)
-            .with_selection(self.selection)
+        let builder = V2ScanBuilder::new(self.session.clone(), self.parts.clone())
             .with_projection(self.projection)
             .with_some_filter(self.filter)
-            .with_some_limit(self.limit)
-            .with_ordered(self.ordered)
-            // The partition is already exactly one Parquet row group. `SplitBy::Layout` would
-            // otherwise insert arbitrary 100k-row boundaries and decompress boundary pages twice.
-            .with_split_by(SplitBy::RowCount(row_count));
-        let stream = builder.into_stream()?;
+            .with_row_range(self.row_range)
+            .with_selection(self.selection);
+        let driver = ScanDriver::new(self.session.handle(), self.concurrency, self.ordered);
+        let stream = driver.run(builder);
+        let stream = match self.limit {
+            Some(limit) => limit_rows(stream, limit),
+            None => stream,
+        };
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             self.dtype, stream,
         )))
     }
+}
+
+/// Ends `stream` after `limit` rows, slicing the batch that crosses it.
+fn limit_rows(
+    stream: BoxStream<'static, VortexResult<ArrayRef>>,
+    limit: u64,
+) -> BoxStream<'static, VortexResult<ArrayRef>> {
+    stream
+        .scan(limit, |remaining, batch| {
+            if *remaining == 0 {
+                return future::ready(None);
+            }
+            let batch = batch.and_then(|batch| {
+                let len = batch.len() as u64;
+                if len <= *remaining {
+                    *remaining -= len;
+                    Ok(batch)
+                } else {
+                    let keep = usize::try_from(*remaining)?;
+                    *remaining = 0;
+                    batch.slice(0..keep)
+                }
+            });
+            future::ready(Some(batch))
+        })
+        .boxed()
 }
 
 struct EmptyScan {

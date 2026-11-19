@@ -5,8 +5,8 @@
 //! [`FileHandle`] carries the three things opening a Parquet file needs: a random-access reader, the
 //! file's length, and the session whose runtime drives the I/O. It exists as a type rather than as
 //! three arguments so that the eager footer reads and the lazy segment reads are expressed against
-//! the same object — the first through exact footer-range reads, the second through
-//! [`segment_source`](FileHandle::segment_source).
+//! the same object — the first through exact footer-range reads, the second through the V2 scan's
+//! placed segment reader over [`read`](FileHandle::read).
 
 use std::fmt::Debug;
 use std::ops::Range;
@@ -19,15 +19,10 @@ use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
 use vortex::io::VortexReadAt;
 use vortex::io::filesystem::FileSystem;
-use vortex::io::runtime::Handle;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::StdFileSystem;
-use vortex::layout::segments::SegmentSource;
-use vortex::metrics::DefaultMetricsRegistry;
 use vortex::metrics::MetricsRegistry;
 use vortex::session::VortexSession;
-
-use crate::segments::SegmentTable;
 
 /// A [`FileSystem`] over the local filesystem, driven on `session`'s runtime.
 ///
@@ -166,21 +161,5 @@ impl FileHandle {
     pub async fn read_suffix(&self, length: u64) -> VortexResult<ByteBuffer> {
         let length = length.min(self.size);
         self.read_range(self.size - length..self.size).await
-    }
-
-    /// Builds a coalescing [`SegmentSource`] over `table`, backed by this file.
-    pub fn segment_source(&self, table: SegmentTable) -> VortexResult<Arc<dyn SegmentSource>> {
-        let handle = self.handle()?;
-        let default_metrics = DefaultMetricsRegistry::default();
-        let metrics: &dyn MetricsRegistry = self
-            .metrics
-            .as_deref()
-            .unwrap_or(&default_metrics as &dyn MetricsRegistry);
-        Ok(table.into_source(Arc::clone(&self.read), handle, metrics))
-    }
-
-    /// The runtime handle segment sources should be driven on.
-    fn handle(&self) -> VortexResult<Handle> {
-        Ok(self.session.handle())
     }
 }

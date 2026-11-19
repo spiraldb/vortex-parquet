@@ -4,10 +4,10 @@
 //!
 //! # Why this is not per-leaf
 //!
-//! The default stores weak references. Filter and projection futures are assembled before execution,
-//! so a projection of an already-filtered field captures the same live future then; concurrent scans
-//! likewise coalesce while a decode is in flight. Once the consumers release their `Arc`s, the array
-//! is immediately reclaimable instead of remaining resident for the scan. Explicit bounded and
+//! The default stores weak references. A scan lowers a field once per filter conjunct and once for
+//! its projection, and every one of those plans takes the same entry when it is lowered, so they
+//! share one decode; concurrent scans of the same row group share it too. Once the plans release
+//! their `Arc`s, the array is immediately reclaimable instead of remaining resident for the scan. Explicit bounded and
 //! unbounded policies retain completed arrays for callers that knowingly want a data cache.
 //!
 //! # What the budget is measured in

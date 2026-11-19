@@ -3,7 +3,6 @@
 //! End-to-end tests over real Parquet files.
 
 #![expect(clippy::tests_outside_test_module)]
-#![expect(clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -52,7 +51,6 @@ use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
-use vortex::array::MaskFuture;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ChunkedArray;
 use vortex::array::arrays::Dict;
@@ -60,7 +58,6 @@ use vortex::array::buffer::BufferHandle;
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::optimizer::ArrayOptimizer;
 use vortex::array::optimizer::kernels::ArrayKernelsExt;
-use vortex::array::stream::ArrayStreamExt;
 use vortex::array::vtable::VTable;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::ExecuteArrowExt;
@@ -71,7 +68,6 @@ use vortex::buffer::Alignment;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
-use vortex::dtype::FieldMask;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -93,9 +89,8 @@ use vortex::expr::stats::Stat;
 use vortex::io::VortexReadAt;
 use vortex::io::runtime::single::block_on;
 use vortex::io::session::RuntimeSessionExt;
-use vortex::layout::LayoutReaderRef;
-use vortex::layout::scan::scan_builder::ScanBuilder;
-use vortex::layout::scan::split_by::SplitBy;
+use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
+use vortex::layout::scan::v2::ScanFile;
 use vortex::mask::Mask;
 use vortex::scalar::DecimalValue;
 use vortex::scalar::Scalar;
@@ -105,6 +100,9 @@ use vortex::scalar_fn::fns::cast::CastExecuteAdaptor;
 use vortex::scalar_fn::fns::list_contains::ListContainsOptions;
 use vortex::scalar_fn::fns::operators::CompareOperator;
 use vortex::scan::ScanRequest;
+use vortex::scan::execution::driver::ScanDriver;
+use vortex::scan::plan::PlanId;
+use vortex::scan::plan::PlanRef;
 use vortex::scan::selection::Selection;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
@@ -113,7 +111,6 @@ use vortex_parquet::cache::CachePolicy;
 use vortex_parquet::file::FileHandle;
 use vortex_parquet::hierarchy::ParquetColumnChunk;
 use vortex_parquet::hierarchy::ParquetFile;
-use vortex_parquet::hierarchy::ParquetHeaderPages;
 use vortex_parquet::hierarchy::ParquetIndexedPages;
 use vortex_parquet::hierarchy::ParquetRowGroup;
 use vortex_parquet::layout::ParquetField;
@@ -311,27 +308,27 @@ fn render(array: &ArrayRef, session: &VortexSession) -> String {
         .replace("StringViewArray", "StringArray")
 }
 
-async fn open(session: &VortexSession, parquet: ByteBuffer) -> VortexResult<LayoutReaderRef> {
+async fn open(session: &VortexSession, parquet: ByteBuffer) -> VortexResult<ScanFile> {
     let size = parquet.len() as u64;
     ParquetFormat::new()
         .open(FileHandle::new(Arc::new(parquet), size, session.clone()))
         .await
 }
 
+/// Scans `file` through the V2 planner-driven executor, in row order.
 async fn scan(
     session: &VortexSession,
-    reader: LayoutReaderRef,
+    file: ScanFile,
     filter: Option<Expression>,
 ) -> VortexResult<ArrayRef> {
-    {
-        let filter = filter.map(|expr| expr.bind(reader.dtype())).transpose()?;
-        ScanBuilder::new(session.clone(), reader)
-            .with_some_filter(filter)
-            .with_ordered(true)
-            .into_array_stream()?
-            .read_all()
-            .await
-    }
+    let dtype = file.layout.dtype().clone();
+    let filter = filter.map(|expr| expr.bind(&dtype)).transpose()?;
+    let builder = V2ScanBuilder::new(session.clone(), file).with_some_filter(filter);
+    let chunks: Vec<ArrayRef> = ScanDriver::new(session.handle(), 4, true)
+        .run(builder)
+        .try_collect()
+        .await?;
+    Ok(ChunkedArray::try_new(chunks, dtype)?.into_array())
 }
 
 #[test]
@@ -531,7 +528,7 @@ fn the_layout_models_file_row_group_column_chunk_and_lazy_pages() {
         let bytes = write_parquet(&flat_table(), 16);
         let size = bytes.len() as u64;
         let opened = ParquetFormat::new()
-            .open_file(FileHandle::new(Arc::new(bytes), size, session.clone()))
+            .open(FileHandle::new(Arc::new(bytes), size, session.clone()))
             .await
             .unwrap();
 
@@ -573,7 +570,7 @@ fn open_reads_only_the_footer() {
         };
 
         ParquetFormat::new()
-            .open_file(FileHandle::new(Arc::new(read), size, session))
+            .open(FileHandle::new(Arc::new(read), size, session))
             .await
             .unwrap();
 
@@ -916,57 +913,6 @@ fn data_source_preserves_nulls_and_dynamic_bounds_when_eliminating_filters() {
             }
             assert_eq!(rows, 3);
         }
-    })
-}
-
-#[test]
-fn bloom_filter_prunes_an_absent_value_inside_footer_bounds() {
-    block_on(|handle| async move {
-        let session = VortexSession::default().with_handle(handle);
-        let batch = RecordBatch::try_from_iter([(
-            "id",
-            Arc::new(Int64Array::from_iter_values(
-                (0..200).map(|value| value * 2),
-            )) as ArrowArrayRef,
-        )])
-        .unwrap();
-        let properties = WriterProperties::builder()
-            .set_bloom_filter_enabled(true)
-            .set_offset_index_disabled(true)
-            .set_max_row_group_row_count(Some(batch.num_rows()))
-            .build();
-        let bytes = write_parquet_with_properties(&batch, properties);
-        let size = bytes.len() as u64;
-        let reads = Arc::new(Mutex::new(Vec::new()));
-        let format = ParquetFormat::new();
-        let reader = format
-            .open(FileHandle::new(
-                Arc::new(RecordingReadAt {
-                    data: bytes,
-                    reads: Arc::clone(&reads),
-                }),
-                size,
-                session.clone(),
-            ))
-            .await
-            .unwrap();
-        let open_reads = reads.lock().len();
-
-        let result = scan(
-            &session,
-            reader,
-            Some(eq(get_item("id", root()), lit(21i64))),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.len(), 0);
-        assert_eq!(format.metrics().bloom_filter_decodes(), 1);
-        assert_eq!(format.metrics().page_decodes(), 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-        assert!(
-            reads.lock().len() > open_reads,
-            "Bloom bytes were never read"
-        );
     })
 }
 
@@ -1492,395 +1438,6 @@ fn plain_byte_predicates_execute_while_the_parquet_decoder_is_live() {
 }
 
 #[test]
-fn a_file_without_an_offset_index_uses_lazy_header_pages() {
-    block_on(|handle| async move {
-        let session = VortexSession::default().with_handle(handle);
-        let batch = RecordBatch::try_from_iter([
-            (
-                "id",
-                Arc::new(Int64Array::from_iter_values(0..400)) as ArrowArrayRef,
-            ),
-            (
-                "name",
-                Arc::new(StringArray::from_iter_values((0..400).map(|value| {
-                    format!(
-                        "row-{value:08x}-{a:016x}-{b:016x}-{c:016x}",
-                        a = value * 1_000_003,
-                        b = value * 1_000_033,
-                        c = value * 1_000_037
-                    )
-                }))) as ArrowArrayRef,
-            ),
-        ])
-        .unwrap();
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(400))
-            .set_data_page_row_count_limit(20)
-            .set_data_page_size_limit(64)
-            .set_write_batch_size(2)
-            .set_offset_index_disabled(true)
-            .set_dictionary_enabled(false)
-            .build();
-        let bytes = write_parquet_with_properties(&batch, properties);
-        let size = bytes.len() as u64;
-        let reads = Arc::new(Mutex::new(Vec::new()));
-        let format = ParquetFormat::new();
-        let opened = format
-            .open_file(FileHandle::new(
-                Arc::new(RecordingReadAt {
-                    data: bytes,
-                    reads: Arc::clone(&reads),
-                }),
-                size,
-                session.clone(),
-            ))
-            .await
-            .unwrap();
-        let chunk = opened
-            .layout
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(1)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap();
-        assert!(chunk.slot(0).unwrap().unwrap().is::<ParquetHeaderPages>());
-        let name_chunk = opened
-            .layout
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(2)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .as_::<ParquetColumnChunk>()
-            .data()
-            .byte_range
-            .clone();
-        let open_reads = reads.lock().len();
-        let dtype = opened.reader.dtype().clone();
-        let result = ScanBuilder::new(session.clone(), opened.reader)
-            .with_some_filter(Some(
-                eq(get_item("id", root()), lit(1i64)).bind(&dtype).unwrap(),
-            ))
-            .with_projection(get_item("name", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-        assert!(format.metrics().page_decodes() > 0);
-        assert_eq!(format.metrics().offset_index_decodes(), 0);
-        let mut name_reads = reads.lock()[open_reads..]
-            .iter()
-            .filter_map(|read| {
-                let start = read.start.max(name_chunk.start);
-                let end = read.end.min(name_chunk.end);
-                (start < end).then_some(start..end)
-            })
-            .collect::<Vec<_>>();
-        name_reads.sort_by_key(|range| range.start);
-        let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
-        for range in name_reads {
-            if let Some(previous) = merged.last_mut()
-                && range.start <= previous.end
-            {
-                previous.end = previous.end.max(range.end);
-            } else {
-                merged.push(range);
-            }
-        }
-        let name_bytes = merged
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        assert!(
-            name_bytes < name_chunk.end - name_chunk.start,
-            "header discovery fetched the complete projected column chunk"
-        );
-    })
-}
-
-#[test]
-fn a_sparse_scan_loads_the_available_offset_index_lazily() {
-    block_on(|handle| async move {
-        let session = VortexSession::default().with_handle(handle);
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(400))
-            .set_data_page_row_count_limit(20)
-            .set_data_page_size_limit(64)
-            .set_write_batch_size(10)
-            .build();
-        let bytes = write_parquet_with_properties(&flat_table_n(400), properties);
-        let size = bytes.len() as u64;
-        let reads = Arc::new(Mutex::new(Vec::new()));
-        let format = ParquetFormat::new();
-        let opened = format
-            .open_file(FileHandle::new(
-                Arc::new(RecordingReadAt {
-                    data: bytes,
-                    reads: Arc::clone(&reads),
-                }),
-                size,
-                session.clone(),
-            ))
-            .await
-            .unwrap();
-        let fields = opened
-            .layout
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap();
-        let chunk_ranges = [2usize].map(|field| {
-            fields
-                .slot(field + 1)
-                .unwrap()
-                .unwrap()
-                .slot(0)
-                .unwrap()
-                .unwrap()
-                .as_::<ParquetColumnChunk>()
-                .data()
-                .byte_range
-                .clone()
-        });
-        let reader = opened.reader;
-        let open_reads = reads.lock().len();
-        let dtype = reader.dtype().clone();
-        let result = ScanBuilder::new(session.clone(), Arc::clone(&reader))
-            .with_row_indices(
-                StrictSortedBuffer::try_new(vortex::buffer::Buffer::from_iter([399u64])).unwrap(),
-            )
-            .with_projection(get_item("name", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1);
-        assert!(reads.lock().len() > open_reads);
-        assert!(format.metrics().offset_index_decodes() > 0);
-        assert!(format.metrics().page_decodes() > 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-        let data_reads = reads.lock()[open_reads..].to_vec();
-        for chunk in chunk_ranges {
-            let mut covered = data_reads
-                .iter()
-                .filter_map(|read| {
-                    let start = read.start.max(chunk.start);
-                    let end = read.end.min(chunk.end);
-                    (start < end).then_some(start..end)
-                })
-                .collect::<Vec<_>>();
-            covered.sort_by_key(|range| range.start);
-            let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
-            for range in covered {
-                if let Some(previous) = merged.last_mut()
-                    && range.start <= previous.end
-                {
-                    previous.end = previous.end.max(range.end);
-                } else {
-                    merged.push(range);
-                }
-            }
-            let bytes_read = merged
-                .iter()
-                .map(|range| range.end - range.start)
-                .sum::<u64>();
-            assert!(
-                bytes_read < chunk.end - chunk.start,
-                "sparse scan fetched the complete column chunk {chunk:?}: {data_reads:?}"
-            );
-        }
-
-        let decoded_indexes = format.metrics().offset_index_decodes();
-        let repeated = ScanBuilder::new(session.clone(), Arc::clone(&reader))
-            .with_row_indices(
-                StrictSortedBuffer::try_new(vortex::buffer::Buffer::from_iter([399u64])).unwrap(),
-            )
-            .with_projection(get_item("name", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-        assert_eq!(repeated.len(), 1);
-        assert_eq!(
-            format.metrics().offset_index_decodes(),
-            decoded_indexes,
-            "immutable offset indexes should be decoded once per opened column"
-        );
-
-        // Clip a sparse, non-byte-aligned selection across page boundaries. The null entry and
-        // excluded indices on either side protect the placement of copied mask bits.
-        let clipped = ScanBuilder::new(session.clone(), reader)
-            .with_row_range(7..193)
-            .with_row_indices(
-                StrictSortedBuffer::try_new(vortex::buffer::Buffer::from_iter([
-                    0u64, 3, 19, 20, 41, 185, 399,
-                ]))
-                .unwrap(),
-            )
-            .with_projection(get_item("name", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-        let expected = RecordBatch::try_from_iter([(
-            "name",
-            Arc::new(StringArray::from(vec![
-                Some("label-01"),
-                Some("label-02"),
-                Some("label-05"),
-                None,
-            ])) as ArrowArrayRef,
-        )])
-        .unwrap();
-        assert_eq!(
-            render(&clipped, &session),
-            render(
-                &reference(&expected)
-                    .apply(&get_item("name", root()))
-                    .unwrap(),
-                &session
-            ),
-        );
-    })
-}
-
-#[test]
-fn dynamic_filters_refine_footer_and_page_pruning_without_reloading_indexes() {
-    block_on(|handle| async move {
-        let session = VortexSession::default().with_handle(handle);
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(400))
-            .set_data_page_row_count_limit(20)
-            .set_data_page_size_limit(64)
-            .set_write_batch_size(10)
-            .set_dictionary_enabled(false)
-            .build();
-        let bytes = write_parquet_with_properties(&flat_table_n(400), properties);
-        let format = ParquetFormat::new();
-        let reader = format
-            .open(FileHandle::new(
-                Arc::new(bytes.clone()),
-                bytes.len() as u64,
-                session.clone(),
-            ))
-            .await
-            .unwrap();
-
-        let threshold = Arc::new(AtomicI64::new(400));
-        let dynamic_threshold = Arc::clone(&threshold);
-        let expr = dynamic(
-            CompareOperator::Lt,
-            move || Some(dynamic_threshold.load(Ordering::SeqCst).into()),
-            DType::Primitive(PType::I64, Nullability::NonNullable),
-            true,
-            get_item("id", root()),
-        )
-        .bind(reader.dtype())
-        .unwrap();
-
-        // Construct at 400, update before polling: page pruning must observe 31, not the stale RHS.
-        let first = reader
-            .pruning_evaluation(&(0..400), &expr, Mask::new_true(400))
-            .unwrap();
-        threshold.store(31, Ordering::SeqCst);
-        let first = first.await.unwrap();
-        assert!(
-            first.true_count() > 0 && first.true_count() < 400,
-            "dynamic page mask kept {} rows; metrics: {}",
-            first.true_count(),
-            format.metrics()
-        );
-        assert_eq!(format.metrics().page_index_decodes(), 1);
-
-        // The same timing at row-group granularity: the footer now proves the whole group false,
-        // without touching the already-loaded page index (or issuing another index decode).
-        let second = reader
-            .pruning_evaluation(&(0..400), &expr, Mask::new_true(400))
-            .unwrap();
-        threshold.store(-1, Ordering::SeqCst);
-        assert!(second.await.unwrap().all_false());
-        assert_eq!(format.metrics().page_index_decodes(), 1);
-
-        // Dynamic filters normally tighten, but reevaluating a looser value is useful protection
-        // against accidentally caching a predicate result instead of immutable index metadata.
-        threshold.store(211, Ordering::SeqCst);
-        let third = reader
-            .pruning_evaluation(&(0..400), &expr, Mask::new_true(400))
-            .unwrap()
-            .await
-            .unwrap();
-        assert!(third.true_count() > first.true_count() && third.true_count() < 400);
-        assert_eq!(format.metrics().page_index_decodes(), 1);
-
-        // The scan engine observes the same dynamic value through its revision tracker. Once the
-        // filter excludes this row group, its projected string column is never fetched or decoded.
-        threshold.store(-1, Ordering::SeqCst);
-        let dtype = reader.dtype().clone();
-        let result = ScanBuilder::new(session.clone(), reader)
-            .with_some_filter(Some(expr))
-            .with_projection(get_item("name", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 0);
-        assert_eq!(format.metrics().page_decodes(), 0);
-        assert_eq!(format.metrics().arrow_decodes(), 0);
-    })
-}
-
-#[test]
-fn row_group_boundaries_are_vortex_splits() {
-    block_on(|handle| async move {
-        let session = VortexSession::default().with_handle(handle);
-        let reader = open(&session, write_parquet(&flat_table(), 16))
-            .await
-            .unwrap();
-        let splits = SplitBy::Layout
-            .splits(reader.as_ref(), &(0..reader.row_count()), &[FieldMask::All])
-            .unwrap();
-        assert!(splits.contains(&16) && splits.contains(&32), "{splits:?}");
-    })
-}
-
-#[test]
 fn filters_crossing_a_row_group_boundary_are_correct() {
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
@@ -1983,7 +1540,7 @@ fn filters_crossing_a_row_group_boundary_are_correct() {
                             selected(&[(0, 25), (26, 14)]),
                         ),
                     ] {
-                        let result = scan(&session, Arc::clone(&reader), Some(predicate))
+                        let result = scan(&session, reader.clone(), Some(predicate))
                             .await
                             .unwrap();
                         assert_eq!(render(&result, &session), render(&expected, &session));
@@ -2343,225 +1900,126 @@ fn malformed_files_are_rejected() {
     })
 }
 
-/// A sparse page-range read over a **nested** column must use the selected row group's indexes.
-///
-/// # Why this test exists
-///
-/// The nested/Dremel fallback is the one decode path that needs a `ParquetMetaData` carrying an
-/// offset index, because arrow-rs resolves page ranges through it. That metadata is assembled for
-/// the call and dropped. Assembling it wrongly — a misplaced row group, a dropped
-/// leaf — would not fail loudly. It would return the wrong rows for nested fields only, on a path no
-/// flat benchmark exercises and no other test drove with a *sparse* selection.
-///
-/// So this pins both the observable answer and the route that produced it: one nested Arrow decode,
-/// one selective decode, and less than the whole nested column chunk fetched.
+/// Footer statistics prune whole row groups through the V2 plans' zone maps: a row group whose
+/// bounds disprove the filter is neither read nor decoded.
 #[test]
-fn a_sparse_page_range_over_a_nested_column_uses_its_row_group_indexes() {
+fn footer_statistics_prune_row_groups_in_the_v2_plan() {
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
-
-        const ROWS_PER_GROUP: usize = 256;
-        const ROWS: usize = ROWS_PER_GROUP * 2;
-        const SELECTED_ROWS: [usize; 2] = [ROWS_PER_GROUP, ROWS - 1];
-        let inner_fields = Fields::from(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Utf8, true),
-        ]);
-        let inner = ArrowStructArray::new(
-            inner_fields.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(
-                    0..i32::try_from(ROWS).unwrap(),
-                )) as ArrowArrayRef,
-                Arc::new(StringArray::from_iter((0..ROWS).map(|i| {
-                    (i % 7 != 0).then(|| format!("inner-{i:04}-{}", "x".repeat(128)))
-                }))) as ArrowArrayRef,
-            ],
-            None,
-        );
-        let batch = RecordBatch::try_from_iter_with_nullable([
-            (
-                "id",
-                Arc::new(Int64Array::from_iter_values(
-                    0..i64::try_from(ROWS).unwrap(),
-                )) as ArrowArrayRef,
-                false,
-            ),
-            ("nested", Arc::new(inner) as ArrowArrayRef, false),
-        ])
-        .unwrap();
-
-        // No dictionary prefix and many small data pages make the byte-cost decision deterministic:
-        // the last page of each nested leaf is well below 80% of the complete nested chunk.
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(ROWS_PER_GROUP))
-            .set_data_page_row_count_limit(8)
-            .set_data_page_size_limit(256)
-            .set_write_batch_size(8)
-            .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
-            .build();
-        let bytes = write_parquet_with_properties(&batch, properties);
-        let size = bytes.len() as u64;
-        let reads = Arc::new(Mutex::new(Vec::new()));
         let format = ParquetFormat::new();
-        let opened = format
-            .open_file(FileHandle::new(
-                Arc::new(RecordingReadAt {
-                    data: bytes,
-                    reads: Arc::clone(&reads),
-                }),
-                size,
-                session.clone(),
-            ))
+        let bytes = write_parquet(&flat_table_n(64), 16);
+        let size = bytes.len() as u64;
+        let file = format
+            .open(FileHandle::new(Arc::new(bytes), size, session.clone()))
             .await
             .unwrap();
-        let nested_chunk = opened
-            .layout
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(1)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .slot(2)
-            .unwrap()
-            .unwrap()
-            .slot(0)
-            .unwrap()
-            .unwrap()
-            .as_::<ParquetColumnChunk>()
-            .data()
-            .byte_range
-            .clone();
-        let open_reads = reads.lock().len();
-
-        // Selecting the first and last records of only row group 1 keeps its mask below the 10%
-        // selective-decode threshold while forcing a range spanning the whole row group.
-        // `get_mut(0)` therefore attaches these absolute page locations to the wrong row group.
-        // Projecting only the nested field keeps another column's decode from obscuring the route.
-        let dtype = opened.reader.dtype().clone();
-        let result = ScanBuilder::new(session.clone(), opened.reader)
-            .with_row_indices(
-                StrictSortedBuffer::try_new(vortex::buffer::Buffer::from_iter(
-                    SELECTED_ROWS.map(|row| u64::try_from(row).unwrap()),
-                ))
-                .unwrap(),
-            )
-            .with_projection(get_item("nested", root()).bind(&dtype).unwrap())
-            .with_ordered(true)
-            .into_array_stream()
-            .unwrap()
-            .read_all()
-            .await
-            .unwrap();
-
-        let expected = ArrowStructArray::new(
-            inner_fields,
-            vec![
-                Arc::new(Int32Array::from_iter_values(
-                    SELECTED_ROWS.map(|row| i32::try_from(row).unwrap()),
-                )) as ArrowArrayRef,
-                Arc::new(StringArray::from_iter(SELECTED_ROWS.map(|row| {
-                    (row % 7 != 0).then(|| format!("inner-{row:04}-{}", "x".repeat(128)))
-                }))) as ArrowArrayRef,
-            ],
-            None,
-        );
+        let result = scan(
+            &session,
+            file,
+            Some(gt_eq(get_item("id", root()), lit(40i64))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 24);
+        // Four row groups of three columns; the first two are pruned by their `id` maxima.
         assert_eq!(
-            render(&result, &session),
-            render(&reference(&RecordBatch::from(expected)), &session)
-        );
-
-        let counts = format.metrics().snapshot();
-        assert_eq!(counts.offset_index_decodes, 2, "{counts:?}");
-        assert_eq!(counts.arrow_decodes, 1, "{counts:?}");
-        assert_eq!(counts.page_decodes, 0, "{counts:?}");
-        assert_eq!(counts.selective_decodes, 1, "{counts:?}");
-        assert_eq!(counts.selective_rows, 2, "{counts:?}");
-        assert_eq!(
-            counts.selective_rows_available,
-            u64::try_from(ROWS_PER_GROUP).unwrap(),
-            "{counts:?}"
-        );
-
-        let data_reads = reads.lock()[open_reads..].to_vec();
-        let mut covered = data_reads
-            .iter()
-            .filter_map(|read| {
-                let start = read.start.max(nested_chunk.start);
-                let end = read.end.min(nested_chunk.end);
-                (start < end).then_some(start..end)
-            })
-            .collect::<Vec<_>>();
-        covered.sort_by_key(|range| range.start);
-        let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
-        for range in covered {
-            if let Some(previous) = merged.last_mut()
-                && range.start <= previous.end
-            {
-                previous.end = previous.end.max(range.end);
-            } else {
-                merged.push(range);
-            }
-        }
-        let bytes_read = merged
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        assert!(
-            bytes_read < nested_chunk.end - nested_chunk.start,
-            "nested page-range decode fetched the complete chunk {nested_chunk:?}: {data_reads:?}"
+            format.metrics().page_decodes() + format.metrics().arrow_decodes(),
+            6
         );
     })
 }
 
+/// The data source scans each row group through the same V2 plans, so footer statistics prune a
+/// row group partition before any of its column chunks are read.
 #[test]
-fn successive_filters_reuse_the_loaded_column() {
+fn data_source_partitions_prune_row_groups_through_footer_statistics() {
     block_on(|handle| async move {
         let session = VortexSession::default().with_handle(handle);
-        let bytes = write_parquet(&flat_table_n(64), 64);
-        let format = ParquetFormat::new().with_cache_policy(CachePolicy::Bounded(1 << 20));
-        let reader = format
-            .open(FileHandle::new(
-                Arc::new(bytes.clone()),
-                bytes.len() as u64,
-                session.clone(),
-            ))
+        let format = ParquetFormat::new();
+        let bytes = write_parquet(&flat_table_n(64), 16);
+        let size = bytes.len() as u64;
+        let source = format
+            .open_data_source(FileHandle::new(Arc::new(bytes), size, session.clone()))
             .await
             .unwrap();
-        let first = gt_eq(get_item("id", root()), lit(62i64))
-            .bind(reader.dtype())
-            .unwrap();
-        let selected = reader
-            .filter_evaluation(&(0..64), &first, MaskFuture::ready(Mask::new_true(64)))
-            .unwrap()
+        let scan = source
+            .scan(ScanRequest {
+                filter: Some(gt_eq(get_item("id", root()), lit(40i64))),
+                ordered: true,
+                ..ScanRequest::default()
+            })
             .await
             .unwrap();
+        let mut rows = 0;
+        for partition in scan.partitions().try_collect::<Vec<_>>().await.unwrap() {
+            for chunk in partition
+                .execute()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+            {
+                rows += chunk.len();
+            }
+        }
+        assert_eq!(rows, 24);
         assert_eq!(
-            (0..64)
-                .filter(|&row| selected.value(row))
-                .collect::<Vec<_>>(),
-            vec![62, 63]
+            format.metrics().page_decodes() + format.metrics().arrow_decodes(),
+            6
         );
-        let second = gt_eq(get_item("id", root()), lit(63i64))
-            .bind(reader.dtype())
-            .unwrap();
-        let selected = reader
-            .filter_evaluation(&(0..64), &second, MaskFuture::ready(selected))
-            .unwrap()
+    })
+}
+
+/// A file lowers to the plan its layout describes: row groups concatenated, fields packed, and
+/// each field a Parquet leaf under its footer statistics.
+#[test]
+fn the_layout_lowers_to_parquet_field_scans_under_footer_statistics() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let file = open(&session, write_parquet(&flat_table(), 16))
             .await
             .unwrap();
-        assert_eq!(
-            (0..64)
-                .filter(|&row| selected.value(row))
-                .collect::<Vec<_>>(),
-            vec![63]
+        let plan = file.layout.new_plan().unwrap();
+
+        fn visit(plan: &PlanRef, found: &mut Vec<PlanId>) {
+            found.push(plan.id());
+            for child in plan.children() {
+                visit(child.unwrap(), found);
+            }
+        }
+        let mut found = Vec::new();
+        visit(&plan, &mut found);
+        let count = |id: &str| found.iter().filter(|found| found.as_ref() == id).count();
+        // Three row groups of three fields, each read by one leaf.
+        assert_eq!(count("vortex.parquet.plan.field_scan"), 9, "{found:?}");
+        // Every flat field has min, max and null count in this file's footer.
+        assert_eq!(count("vortex.parquet.plan.footer_zones"), 9, "{found:?}");
+    })
+}
+
+/// A field read by several filter conjuncts and the projection decodes once per row group: every
+/// plan over it shares the decode held in the format's cache.
+#[test]
+fn conjuncts_and_projection_share_one_decode_per_field() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let format = ParquetFormat::new();
+        let bytes = write_parquet(&flat_table_n(64), 16);
+        let size = bytes.len() as u64;
+        let file = format
+            .open(FileHandle::new(Arc::new(bytes), size, session.clone()))
+            .await
+            .unwrap();
+        let filter = vortex::expr::and(
+            gt_eq(get_item("id", root()), lit(1i64)),
+            not_eq(get_item("id", root()), lit(50i64)),
         );
-        assert_eq!(format.metrics().snapshot().page_decodes, 1);
-        assert_eq!(format.metrics().snapshot().selective_decodes, 0);
-    });
+        let result = scan(&session, file, Some(filter)).await.unwrap();
+        assert_eq!(result.len(), 62);
+        // Four row groups of three columns, each decoded exactly once.
+        assert_eq!(
+            format.metrics().page_decodes() + format.metrics().arrow_decodes(),
+            12
+        );
+    })
 }

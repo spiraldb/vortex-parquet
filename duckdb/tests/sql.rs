@@ -769,7 +769,8 @@ fn projection_count_and_early_stop_avoid_unneeded_decoding() {
             })
             .collect();
         assert_eq!(rows, expected);
-        assert!(format.metrics().snapshot().page_decodes < 8);
+        let decodes = format.metrics().snapshot().page_decodes;
+        assert!(decodes < 8, "{decodes}");
     }
 
     // Parameter rebinding and reordered projection must preserve original column identities.

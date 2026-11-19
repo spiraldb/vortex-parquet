@@ -48,7 +48,6 @@ use parquet::basic::Compression;
 use parquet::basic::Encoding;
 use parquet::basic::Type as PhysicalType;
 use parquet::column::page::Page;
-use parquet::column::reader::ColumnReaderImpl;
 use parquet::compression::CodecOptions;
 use parquet::compression::create_codec;
 use parquet::data_type::BoolType;
@@ -69,10 +68,8 @@ use parquet::encodings::decoding::get_decoder;
 use parquet::encodings::rle::RleDecoder;
 use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::reader::ChunkReader;
-use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::format::PageHeader;
 #[allow(deprecated)]
-use parquet::format::PageLocation;
 use parquet::format::PageType;
 use parquet::schema::types::ColumnDescPtr;
 use parquet::schema::types::SchemaDescriptor;
@@ -104,6 +101,7 @@ use vortex::array::arrays::ScalarFn;
 use vortex::array::arrays::ScalarFnArray;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::chunked::ChunkedArrayExt;
+use vortex::array::arrays::decimal::check_precision;
 use vortex::array::arrays::filter::FilterExecuteAdaptor;
 use vortex::array::arrays::filter::FilterKernel;
 use vortex::array::arrays::primitive::PrimitiveArrayExt;
@@ -129,6 +127,7 @@ use vortex::buffer::Buffer;
 use vortex::buffer::BufferMut;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
+use vortex::dtype::DecimalDType;
 use vortex::dtype::NativeDecimalType;
 use vortex::dtype::NativePType;
 use vortex::dtype::PType;
@@ -1038,48 +1037,6 @@ fn read_compressed_chunk<R: ChunkReader>(
     Ok(pages)
 }
 
-#[allow(deprecated)]
-fn read_compressed_locations<R: ChunkReader>(
-    reader: &R,
-    column_metadata: &ColumnChunkMetaData,
-    locations: &[PageLocation],
-) -> VortexResult<Vec<LazyParquetPage>> {
-    let mut pages = Vec::new();
-    if let Some(dictionary_offset) = column_metadata.dictionary_page_offset() {
-        let start = u64::try_from(dictionary_offset)?;
-        let data_start = u64::try_from(column_metadata.data_page_offset())?;
-        if start < data_start {
-            let (dictionary, consumed) = read_compressed_page(
-                reader,
-                start,
-                data_start - start,
-                column_metadata.compression(),
-            )?;
-            vortex_ensure!(
-                consumed == data_start - start,
-                "Parquet dictionary range contains trailing bytes"
-            );
-            if let Some(dictionary) = dictionary {
-                pages.push(dictionary);
-            }
-        }
-    }
-    for location in locations {
-        let offset = u64::try_from(location.offset)?;
-        let length = u64::try_from(location.compressed_page_size)?;
-        let (page, consumed) =
-            read_compressed_page(reader, offset, length, column_metadata.compression())?;
-        vortex_ensure!(
-            consumed == length,
-            "Parquet offset-index page length is {length}, header describes {consumed}"
-        );
-        if let Some(page) = page {
-            pages.push(page);
-        }
-    }
-    Ok(pages)
-}
-
 /// Decodes a flat physical column chunk into one lazy Vortex array per Parquet data page.
 ///
 /// `Ok(None)` means the logical type or Dremel levels require the field-level Arrow fallback.
@@ -1114,89 +1071,6 @@ pub fn decode_chunk(
     )
 }
 
-/// Decodes the indexed pages needed by a sparse flat-column selection and filters within those
-/// pages through the native Parquet page arrays.
-#[allow(deprecated)]
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn decode_selected_chunk(
-    chunk_reader: SegmentChunkReader,
-    column_metadata: &ColumnChunkMetaData,
-    descriptor: &ColumnDescPtr,
-    dtype: &DType,
-    row_count: u64,
-    all_locations: &[PageLocation],
-    selected_locations: Vec<PageLocation>,
-    row_range: &std::ops::Range<usize>,
-    mask: &Mask,
-    options: ReaderOptions,
-    metrics: Arc<ScanMetrics>,
-    dictionary_values: Arc<OnceLock<ArrayRef>>,
-) -> VortexResult<Option<ArrayRef>> {
-    if descriptor.max_rep_level() != 0
-        || descriptor.max_def_level() > 1
-        || !direct_dtype(dtype, descriptor.physical_type())
-    {
-        return Ok(None);
-    }
-    let total_rows = usize::try_from(row_count)?;
-    if row_range.end < row_range.start
-        || row_range.end - row_range.start != mask.len()
-        || row_range.end > total_rows
-    {
-        return Ok(None);
-    }
-    let pages = read_compressed_locations(&chunk_reader, column_metadata, &selected_locations)?;
-    let Some(array) = decode_page_reader(
-        pages,
-        descriptor,
-        dtype,
-        None,
-        options,
-        metrics,
-        dictionary_values,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    let mut selected = BitBufferMut::with_capacity(array.len());
-    for location in &selected_locations {
-        let Some(page) = all_locations
-            .iter()
-            .position(|candidate| candidate.offset == location.offset)
-        else {
-            return Ok(None);
-        };
-        let start = usize::try_from(location.first_row_index)?;
-        let end = all_locations
-            .get(page + 1)
-            .map_or(Ok(total_rows), |next| usize::try_from(next.first_row_index))?;
-        if end < start || end > total_rows {
-            return Ok(None);
-        }
-        let overlap_start = start.max(row_range.start);
-        let overlap_end = end.min(row_range.end);
-        if overlap_start >= overlap_end {
-            selected.append_n(false, end - start);
-            continue;
-        }
-        selected.append_n(false, overlap_start - start);
-        match mask.slice(overlap_start - row_range.start..overlap_end - row_range.start) {
-            Mask::AllTrue(len) => selected.append_n(true, len),
-            Mask::AllFalse(len) => selected.append_n(false, len),
-            Mask::Values(values) => selected.append_buffer(values.bit_buffer()),
-        }
-        selected.append_n(false, end - overlap_end);
-    }
-    if selected.len() != array.len() {
-        return Ok(None);
-    }
-    Ok(Some(filter_page_chunks(
-        array,
-        Mask::from_buffer(selected.freeze()),
-    )?))
-}
-
 /// Distributes a selection over decoded page chunks without resolving a chunk for every row.
 ///
 /// The generic chunked filter turns a moderately dense mask into per-row take indices. These
@@ -1224,265 +1098,6 @@ pub(crate) fn filter_page_chunks(array: ArrayRef, mask: Mask) -> VortexResult<Ar
         offset = end;
     }
     Ok(ChunkedArray::try_new(chunks, array.dtype().clone())?.into_array())
-}
-
-/// Decodes sparse flat-column records directly into Vortex buffers.
-///
-/// This is the no-offset-index counterpart of [`decode_selected_chunk`]. It cannot avoid fetching
-/// the column chunk, but `ColumnReaderImpl::skip_records` can skip complete pages from their headers
-/// and skip encoded runs within the boundary pages. Unlike the Arrow fallback, the selected values
-/// are constructed as Vortex arrays directly.
-pub(crate) fn decode_selected_records(
-    chunk_reader: SegmentChunkReader,
-    column_metadata: &ColumnChunkMetaData,
-    descriptor: &ColumnDescPtr,
-    dtype: &DType,
-    row_count: u64,
-    row_range: &std::ops::Range<usize>,
-    mask: &Mask,
-) -> VortexResult<Option<ArrayRef>> {
-    if descriptor.max_rep_level() != 0
-        || descriptor.max_def_level() > 1
-        || !direct_dtype(dtype, descriptor.physical_type())
-    {
-        return Ok(None);
-    }
-    let row_count = usize::try_from(row_count)?;
-    vortex_ensure!(
-        row_range.end >= row_range.start
-            && row_range.end - row_range.start == mask.len()
-            && row_range.end <= row_count,
-        "selected row range does not fit the Parquet column chunk"
-    );
-    let reader =
-        SerializedPageReader::new(Arc::new(chunk_reader), column_metadata, row_count, None)
-            .map_err(|error| vortex_err!("failed to open selected-record page reader: {error}"))?;
-
-    macro_rules! selected {
-        ($parquet_type:ty) => {{
-            read_selected_records::<$parquet_type>(
-                ColumnReaderImpl::new(Arc::clone(descriptor), Box::new(reader)),
-                descriptor,
-                row_range,
-                mask,
-            )?
-        }};
-    }
-
-    Ok(Some(match descriptor.physical_type() {
-        PhysicalType::BOOLEAN => {
-            let (values, validity) = selected!(BoolType);
-            let mut values = values.into_iter();
-            let array: BoolArray = match validity {
-                Some(validity) => validity
-                    .into_iter()
-                    .map(|valid| valid.then(|| values.next()).flatten())
-                    .collect(),
-                None => values.collect(),
-            };
-            array.into_array()
-        }
-        PhysicalType::INT32 if dtype.is_decimal() => {
-            let (values, validity) = selected!(Int32Type);
-            build_decimal(values, validity, dtype)?
-        }
-        PhysicalType::INT32 => {
-            let (values, validity) = selected!(Int32Type);
-            let (values, validity) = scatter(values, validity);
-            logicalize(
-                PrimitiveArray::new(Buffer::from(values), validity).into_array(),
-                dtype,
-            )?
-        }
-        PhysicalType::INT64 if dtype.is_decimal() => {
-            let (values, validity) = selected!(Int64Type);
-            build_decimal(values, validity, dtype)?
-        }
-        PhysicalType::INT64 => {
-            let (values, validity) = selected!(Int64Type);
-            let (values, validity) = scatter(values, validity);
-            logicalize(
-                PrimitiveArray::new(Buffer::from(values), validity).into_array(),
-                dtype,
-            )?
-        }
-        PhysicalType::FLOAT => {
-            let (values, validity) = selected!(FloatType);
-            let (values, validity) = scatter(values, validity);
-            logicalize(
-                PrimitiveArray::new(Buffer::from(values), validity).into_array(),
-                dtype,
-            )?
-        }
-        PhysicalType::DOUBLE => {
-            let (values, validity) = selected!(DoubleType);
-            let (values, validity) = scatter(values, validity);
-            logicalize(
-                PrimitiveArray::new(Buffer::from(values), validity).into_array(),
-                dtype,
-            )?
-        }
-        PhysicalType::BYTE_ARRAY => {
-            let (values, validity) = selected!(ByteArrayType);
-            build_bytes(
-                values.iter().map(ByteArray::data),
-                validity.as_deref(),
-                dtype,
-            )?
-        }
-        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-            let (values, validity) = selected!(FixedLenByteArrayType);
-            build_fixed_bytes(values, validity, dtype)?
-        }
-        PhysicalType::INT96 => {
-            let (values, validity) = selected!(Int96Type);
-            build_int96(values, validity, dtype)?
-        }
-    }))
-}
-
-type SelectedRecords<T> = (Vec<T>, Option<Vec<bool>>);
-
-fn read_selected_records<T: ParquetDataType>(
-    mut reader: ColumnReaderImpl<T>,
-    descriptor: &ColumnDescPtr,
-    row_range: &std::ops::Range<usize>,
-    mask: &Mask,
-) -> VortexResult<SelectedRecords<T::T>> {
-    let selected = mask.true_count();
-    let mut values = Vec::with_capacity(selected);
-    let mut definition_levels =
-        (descriptor.max_def_level() > 0).then(|| Vec::with_capacity(selected));
-
-    let skipped = reader
-        .skip_records(row_range.start)
-        .map_err(|error| vortex_err!("failed to skip leading Parquet records: {error}"))?;
-    vortex_ensure!(
-        skipped == row_range.start,
-        "skipped {skipped} of {} leading Parquet records",
-        row_range.start
-    );
-
-    let mut cursor = 0usize;
-    let all_slice = [(0, mask.len())];
-    let slices: &[(usize, usize)] = match mask.slices() {
-        vortex::mask::AllOr::All => &all_slice,
-        vortex::mask::AllOr::None => &[],
-        vortex::mask::AllOr::Some(slices) => slices,
-    };
-    if descriptor.max_def_level() == 0 && !slices.is_empty() {
-        // Calling parquet-rs once for every isolated hit is expensive for highly fragmented masks.
-        // Coalesce nearby runs, decode the small intervening gaps, and discard those gap values
-        // before returning. The gap limit follows the mask density: sparse masks tolerate a wider
-        // gap while denser masks avoid degenerating into a full-column decode.
-        let max_gap = (mask.len() / selected / 2).clamp(1, 64);
-        let mut cursor = 0usize;
-        let mut slice_index = 0usize;
-        while slice_index < slices.len() {
-            let first_slice = slice_index;
-            let start = slices[slice_index].0;
-            let mut end = slices[slice_index].1;
-            slice_index += 1;
-            while let Some(&(next_start, next_end)) = slices.get(slice_index) {
-                if next_start - end > max_gap {
-                    break;
-                }
-                end = next_end;
-                slice_index += 1;
-            }
-
-            let gap = start - cursor;
-            if gap != 0 {
-                let skipped = reader
-                    .skip_records(gap)
-                    .map_err(|error| vortex_err!("failed to skip Parquet mask gap: {error}"))?;
-                vortex_ensure!(skipped == gap, "skipped {skipped} of {gap} Parquet records");
-            }
-
-            let span = end - start;
-            let mut decoded = Vec::with_capacity(span);
-            let mut span_levels =
-                (descriptor.max_def_level() > 0).then(|| Vec::with_capacity(span));
-            let (records, decoded_values, levels) = reader
-                .read_records(span, span_levels.as_mut(), None, &mut decoded)
-                .map_err(|error| vortex_err!("failed to read selected Parquet records: {error}"))?;
-            vortex_ensure!(
-                records == span && levels == span,
-                "read {records} records, {decoded_values} values, and {levels} levels of {span} Parquet records"
-            );
-
-            let included = &slices[first_slice..slice_index];
-            let mut included_index = 0usize;
-            let mut decoded = decoded.into_iter();
-            for offset in 0..span {
-                let row = start + offset;
-                while row >= included[included_index].1 {
-                    included_index += 1;
-                }
-                let level = span_levels
-                    .as_ref()
-                    .map_or_else(|| descriptor.max_def_level(), |levels| levels[offset]);
-                let value = (level == descriptor.max_def_level())
-                    .then(|| decoded.next())
-                    .flatten();
-                if row >= included[included_index].0 {
-                    if let Some(levels) = definition_levels.as_mut() {
-                        levels.push(level);
-                    }
-                    if let Some(value) = value {
-                        values.push(value);
-                    }
-                }
-            }
-            vortex_ensure!(
-                decoded.next().is_none(),
-                "Parquet decoder returned more than {decoded_values} values for a coalesced span"
-            );
-            cursor = end;
-        }
-        let validity = definition_levels.map(|levels| {
-            levels
-                .into_iter()
-                .map(|level| level == descriptor.max_def_level())
-                .collect::<Vec<_>>()
-        });
-        let expected_values = validity.as_ref().map_or(selected, |validity| {
-            validity.iter().filter(|valid| **valid).count()
-        });
-        vortex_ensure!(
-            validity.as_ref().map_or(selected, Vec::len) == selected
-                && values.len() == expected_values,
-            "decoded the wrong number of selected Parquet records or values"
-        );
-        return Ok((values, validity));
-    }
-
-    for &(start, end) in slices {
-        let gap = start.saturating_sub(cursor);
-        if gap != 0 {
-            let skipped = reader
-                .skip_records(gap)
-                .map_err(|error| vortex_err!("failed to skip Parquet mask gap: {error}"))?;
-            vortex_ensure!(skipped == gap, "skipped {skipped} of {gap} Parquet records");
-        }
-        let wanted = end - start;
-        let (records, _values, levels) = reader
-            .read_records(wanted, definition_levels.as_mut(), None, &mut values)
-            .map_err(|error| vortex_err!("failed to read selected Parquet records: {error}"))?;
-        vortex_ensure!(
-            records == wanted && levels == wanted,
-            "read {records} records and {levels} levels of {wanted} selected Parquet records"
-        );
-        cursor = end;
-    }
-
-    let validity = definition_levels.map(|levels| {
-        levels
-            .into_iter()
-            .map(|level| level == descriptor.max_def_level())
-            .collect::<Vec<_>>()
-    });
-    Ok((values, validity))
 }
 
 fn decode_page_reader(
@@ -2436,12 +2051,10 @@ where
         let DType::Decimal(decimal_dtype, _) = dtype else {
             vortex_bail!("Parquet decimal decoder received non-decimal dtype {dtype}")
         };
-        return Ok(DecimalArray::try_new(
-            values,
-            *decimal_dtype,
-            Validity::from(dtype.nullability()),
-        )?
-        .into_array());
+        return Ok(
+            decimal_array(values, *decimal_dtype, Validity::from(dtype.nullability()))?
+                .into_array(),
+        );
     }
     let mut decoder = make_decoder::<T>(data, values, present)?;
     let (decoded, selected_valid) =
@@ -2956,7 +2569,7 @@ where
         } else {
             Validity::NonNullable
         };
-        return Ok(DecimalArray::try_new(values, *decimal_dtype, validity)?.into_array());
+        return Ok(decimal_array(values, *decimal_dtype, validity)?.into_array());
     }
     let mut decoder = make_decoder::<T>(data, values, present)?;
     let mut decoded = vec![N::default(); present];
@@ -2968,6 +2581,44 @@ where
         "Parquet decoder returned {count} of {present} decimal values"
     );
     build_decimal(decoded, valid, dtype)
+}
+
+/// Builds a decimal array from Parquet's unscaled values, checking them against `decimal_dtype`.
+///
+/// Parquet stores every precision up to 9 as INT32 and up to 18 as INT64, while Vortex holds
+/// decimals at the narrowest width the precision allows, so the values are copied to that width.
+/// A file whose values exceed its declared precision is an error here rather than a wrong answer
+/// later. Every caller has already zeroed its null slots, which always fit, so every slot is
+/// checked.
+fn decimal_array<N: NativeDecimalType>(
+    values: Buffer<N>,
+    decimal_dtype: DecimalDType,
+    validity: Validity,
+) -> VortexResult<DecimalArray> {
+    check_precision(
+        values.as_slice(),
+        &Mask::new_true(values.len()),
+        decimal_dtype,
+    )?;
+    let canonical = decimal_dtype.canonical_values_type();
+    let values = if N::DECIMAL_TYPE == canonical {
+        BufferHandle::new_host(values.into_byte_buffer())
+    } else {
+        vortex::array::match_each_decimal_value_type!(canonical, |W| {
+            let narrowed = values
+                .iter()
+                .map(|value| {
+                    <W as vortex::dtype::BigCast>::from(*value).ok_or_else(|| {
+                        vortex_err!(
+                            "Parquet decimal value {value} does not fit its declared {decimal_dtype}"
+                        )
+                    })
+                })
+                .collect::<VortexResult<Vec<W>>>()?;
+            BufferHandle::new_host(Buffer::from(narrowed).into_byte_buffer())
+        })
+    };
+    DecimalArray::try_new_handle_from_trusted_values(values, canonical, decimal_dtype, validity)
 }
 
 fn build_decimal<N>(
@@ -2982,7 +2633,7 @@ where
         vortex_bail!("Parquet decimal decoder received non-decimal dtype {dtype}")
     };
     let (values, validity) = scatter(decoded, valid);
-    Ok(DecimalArray::try_new(Buffer::from(values), *decimal_dtype, validity)?.into_array())
+    Ok(decimal_array(Buffer::from(values), *decimal_dtype, validity)?.into_array())
 }
 
 /// Applies Parquet's logical annotation without going through Arrow.

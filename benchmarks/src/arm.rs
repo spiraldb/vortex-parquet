@@ -126,8 +126,9 @@ impl Arm for DataFusionParquet {
 
 /// This crate: Vortex's scan engine over a Parquet file, decoding one top-level column at a time.
 ///
-/// The chain is `ParquetFormat -> LayoutReader -> LayoutReaderDataSource -> VortexTable`, all of it
-/// upstream machinery except the leaf.
+/// The chain is `ParquetFormat -> ParquetDataSource -> VortexTable`. The data source scans each
+/// row group as a partition through Vortex's V2 plans; all of it is upstream machinery except the
+/// plans' Parquet leaf.
 pub struct VortexParquet {
     format: ParquetFormat,
     label: String,
@@ -289,6 +290,77 @@ impl Arm for VortexListing {
             .with_listing_options(listing_options)
             .with_schema(resolved);
         ctx.register_table(table, Arc::new(ListingTable::try_new(config)?))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Int64Array;
+    use arrow_array::RecordBatch;
+    use arrow_array::StringArray;
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::Int64Type;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+
+    /// DataFusion reaches the V2 plans through `VortexTable` over this crate's data source, with
+    /// the filter pushed into the scan and every row group a partition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn datafusion_scans_parquet_through_the_v2_data_source() -> Result<()> {
+        let rows = 10_000i64;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..rows)) as arrow_array::ArrayRef,
+            ),
+            (
+                "label",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|id| format!("label-{}", id % 7)),
+                )) as arrow_array::ArrayRef,
+            ),
+        ])?;
+        let path = std::env::temp_dir().join(format!(
+            "vortex-parquet-datafusion-{}.parquet",
+            std::process::id()
+        ));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3_000))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path)?,
+            batch.schema(),
+            Some(properties),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let arm = VortexParquet::with_io(IoConfig::default());
+        let ctx = SessionContext::new();
+        let source = Source::parse(path.to_str().context("temp path is UTF-8")?)?;
+        arm.register(&ctx, "t", &source).await?;
+        let batches = ctx
+            .sql("SELECT count(*), sum(id) FROM t WHERE id >= 4000 AND label = 'label-3'")
+            .await?
+            .collect()
+            .await?;
+        std::fs::remove_file(&path)?;
+
+        let expected: Vec<i64> = (4000..rows).filter(|id| id % 7 == 3).collect();
+        let row = &batches[0];
+        assert_eq!(
+            row.column(0).as_primitive::<Int64Type>().value(0),
+            i64::try_from(expected.len())?
+        );
+        assert_eq!(
+            row.column(1).as_primitive::<Int64Type>().value(0),
+            expected.iter().sum::<i64>()
+        );
+        // The footer statistics prune the first row group, so only three of the four decode.
+        assert_eq!(arm.format.metrics().page_decodes(), 6);
         Ok(())
     }
 }
