@@ -257,8 +257,16 @@ impl LazyParquetPage {
         }
     }
 
+    /// The encoding of this page's values.
+    ///
+    /// A dictionary page's values are always PLAIN. Older writers (Parquet format 1.0, parquet-mr)
+    /// label dictionary pages `PLAIN_DICTIONARY`, which would otherwise make the page look like a
+    /// dictionary-encoded *data* page with no dictionary of its own.
     fn encoding(&self) -> Encoding {
-        self.compressed.encoding()
+        match self.compressed.encoding() {
+            Encoding::PLAIN_DICTIONARY if self.is_dictionary_page() => Encoding::PLAIN,
+            encoding => encoding,
+        }
     }
 
     fn num_values(&self) -> u32 {
@@ -430,6 +438,13 @@ pub struct ParquetPageData {
     metrics: Arc<ScanMetrics>,
     decoded_bytes: Arc<OnceLock<DecodedByteValues>>,
     dictionary_codes: Arc<OnceLock<ArrayRef>>,
+    /// The page's decoded values, and the dtype they were decoded as.
+    ///
+    /// A scan cuts a row group into fixed row chunks that need not line up with pages, so a page
+    /// wider than a chunk is executed once per overlapping chunk, each slicing the result. The
+    /// page is immutable, so the first decode serves the rest. Keyed by dtype because the same
+    /// page data can be relabelled, such as a string dictionary read as binary.
+    executed: Arc<OnceLock<(DType, ArrayRef)>>,
 }
 
 impl Display for ParquetPageData {
@@ -648,20 +663,7 @@ macro_rules! parquet_page_encoding {
                 array: Array<Self>,
                 ctx: &mut ExecutionCtx,
             ) -> VortexResult<ExecutionResult> {
-                if matches!(array.dtype(), DType::Utf8(_) | DType::Binary(_))
-                    && let Some(values) = binary_dictionary_values(array.data())?
-                {
-                    let codes = decode_dictionary_codes(array.data(), values.len())?;
-                    let values_utf8 = dictionary_is_utf8(&values)?;
-                    let dictionary = DictArray::try_new(codes, values)?.into_array();
-                    return Ok(ExecutionResult::done(materialize_dictionary_bytes(
-                        dictionary,
-                        values_utf8,
-                        array.dtype(),
-                        ctx,
-                    )?));
-                }
-                Ok(ExecutionResult::done(decode_page_parts(
+                Ok(ExecutionResult::done(execute_page(
                     array.data(),
                     array.dtype(),
                     ctx,
@@ -872,6 +874,7 @@ fn new_page_array(
         metrics,
         decoded_bytes: Arc::new(OnceLock::new()),
         dictionary_codes: Arc::new(OnceLock::new()),
+        executed: Arc::new(OnceLock::new()),
     };
 
     macro_rules! build {
@@ -2199,6 +2202,32 @@ fn binary_dictionary_values(data: &ParquetPageData) -> VortexResult<Option<Array
         ))?
         .into_array(),
     ))
+}
+
+/// Decodes a page into its canonical array, at most once per page and dtype.
+fn execute_page(
+    data: &ParquetPageData,
+    dtype: &DType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    if let Some((executed_dtype, executed)) = data.executed.get()
+        && executed_dtype == dtype
+    {
+        return Ok(executed.clone());
+    }
+    let executed = if matches!(dtype, DType::Utf8(_) | DType::Binary(_))
+        && let Some(values) = binary_dictionary_values(data)?
+    {
+        let codes = decode_dictionary_codes(data, values.len())?;
+        let values_utf8 = dictionary_is_utf8(&values)?;
+        let dictionary = DictArray::try_new(codes, values)?.into_array();
+        materialize_dictionary_bytes(dictionary, values_utf8, dtype, ctx)?
+    } else {
+        decode_page_parts(data, dtype, ctx)?
+    };
+    // A concurrent decode may win; both decoded the same immutable page.
+    drop(data.executed.set((dtype.clone(), executed.clone())));
+    Ok(executed)
 }
 
 /// Whether every entry of a dictionary page is valid UTF-8, checked at most once per dictionary.

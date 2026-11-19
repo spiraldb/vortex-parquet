@@ -2023,3 +2023,71 @@ fn conjuncts_and_projection_share_one_decode_per_field() {
         );
     })
 }
+
+/// Relabels every dictionary page in `bytes` as `PLAIN_DICTIONARY`, as Parquet format 1.0 writers
+/// such as parquet-mr do. parquet-rs always labels them `PLAIN`.
+///
+/// The page header is Thrift compact: field 7 (`dictionary_page_header`) is a struct whose fields
+/// are `num_values` (i32) and then `encoding` (i32). PLAIN and PLAIN_DICTIONARY zigzag-encode to
+/// the single bytes 0 and 4, so the label is rewritten in place without moving anything.
+fn label_dictionary_pages_plain_dictionary(bytes: &[u8]) -> ByteBuffer {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+    let mut patched = bytes.to_vec();
+    let mut relabelled = 0;
+    for row_group in reader.metadata().row_groups() {
+        for column in row_group.columns() {
+            let Some(offset) = column.dictionary_page_offset() else {
+                continue;
+            };
+            let header = usize::try_from(offset).unwrap();
+            let encoding = (header..header + 64)
+                .find_map(|i| {
+                    // A struct field header (type 0xC), then the i32 `num_values` field (0x15).
+                    if patched[i] & 0x0F != 0x0C || patched[i + 1] != 0x15 {
+                        return None;
+                    }
+                    let mut j = i + 2;
+                    while patched[j] & 0x80 != 0 {
+                        j += 1;
+                    }
+                    (patched[j + 1] == 0x15 && patched[j + 2] == 0x00).then_some(j + 2)
+                })
+                .expect("dictionary page header with a PLAIN encoding");
+            patched[encoding] = 0x04;
+            relabelled += 1;
+        }
+    }
+    assert!(relabelled > 0, "the file has no dictionary pages");
+    ByteBuffer::copy_from(patched)
+}
+
+/// Format 1.0 writers label a dictionary page `PLAIN_DICTIONARY`, although its values are PLAIN.
+/// Read literally, the dictionary page looks like a dictionary-encoded *data* page with no
+/// dictionary of its own, and comparisons pushed through the dictionary fail on it. ClickBench's
+/// `hits` files are written this way.
+#[test]
+fn dictionary_pages_labelled_plain_dictionary_are_plain() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values((0..40).map(|i| i % 7 * 1000))) as ArrowArrayRef,
+        )])
+        .unwrap();
+        let plain = write_parquet(&batch, 16);
+        let bytes = label_dictionary_pages_plain_dictionary(&plain);
+        let file = open(&session, bytes).await.unwrap();
+        for (predicate, expected) in [
+            (eq(get_item("value", root()), lit(3000i64)), 6),
+            (not_eq(get_item("value", root()), lit(0i64)), 34),
+        ] {
+            let result = scan(&session, file.clone(), Some(predicate)).await.unwrap();
+            assert_eq!(result.len(), expected);
+        }
+        let all = scan(&session, file, None).await.unwrap();
+        assert_eq!(render(&all, &session), render(&reference(&batch), &session));
+    })
+}
