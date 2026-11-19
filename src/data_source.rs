@@ -39,6 +39,7 @@ use vortex::expr::and_collect;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
 use vortex::io::session::RuntimeSessionExt;
+use vortex::layout::LayoutRef;
 use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
 use vortex::layout::scan::v2::ScanFile;
 use vortex::scalar::Scalar;
@@ -56,6 +57,7 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::execution::driver::ScanDriver;
+use vortex::scan::prepare::ScanCache;
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
@@ -400,7 +402,14 @@ impl DataSource for ParquetDataSource {
             scan_request.filter = self.unsatisfied_filter(filter, &mut HashMap::new())?;
         }
 
-        let parts = self.scan_file()?;
+        let file = self.scan_file()?;
+        let row_group_layouts: Arc<[LayoutRef]> = row_group_layouts(&file.layout)?.into();
+        // Shared by the partitions that scan the whole file's plan, as Vortex's own file scans
+        // share one cache per scan. See `RowGroupPartition::execute` for when that happens.
+        let parts = ScanFile {
+            cache: Some(ScanCache::default()),
+            ..file
+        };
         // Bound once in the file scope and shared by every row group's scan. Optimized as Vortex's
         // own data sources do: engines hand over expressions over their projected row, such as
         // DataFusion's `pack(id: $.id).id >= 4000`, and zone pruning only sees through the
@@ -459,6 +468,8 @@ impl DataSource for ParquetDataSource {
         Ok(Box::new(RowGroupScan {
             dynamic,
             parts,
+            row_group_layouts,
+            row_group_ranges: Arc::clone(&self.row_groups),
             session: self.session.clone(),
             dtype,
             projection,
@@ -500,6 +511,10 @@ struct DynamicPruning {
 struct RowGroupScan {
     dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
+    /// Each row group's own layout, indexed by row group.
+    row_group_layouts: Arc<[LayoutRef]>,
+    /// Each row group's rows within the file, indexed by row group.
+    row_group_ranges: Arc<[Range<u64>]>,
     session: VortexSession,
     dtype: DType,
     projection: BoundExpression,
@@ -545,6 +560,8 @@ impl Stream for RowGroupScan {
         Poll::Ready(Some(Ok(Box::new(RowGroupPartition {
             dynamic: self.dynamic.clone(),
             parts: self.parts.clone(),
+            layout: Arc::clone(&self.row_group_layouts[row_group]),
+            group_start: self.row_group_ranges[row_group].start,
             session: self.session.clone(),
             dtype: self.dtype.clone(),
             projection: self.projection.clone(),
@@ -568,6 +585,10 @@ impl Stream for RowGroupScan {
 struct RowGroupPartition {
     dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
+    /// This row group's own layout.
+    layout: LayoutRef,
+    /// The file row this row group starts at.
+    group_start: u64,
     session: VortexSession,
     dtype: DType,
     projection: BoundExpression,
@@ -618,10 +639,26 @@ impl Partition for RowGroupPartition {
                 stream::empty(),
             )));
         }
-        let builder = V2ScanBuilder::new(self.session.clone(), self.parts.clone())
+        // Planning the row group's own layout keeps each partition's planning proportional to one
+        // row group. Planning the file's root instead re-optimizes every row group's plan in each
+        // partition: the plans are cached per scan, but every partition starts together and misses
+        // the cache, which made planning a TPC-H query cost more than decoding it. A selection is
+        // in file rows, so it keeps the file's plan rather than being translated.
+        let (file, row_range) = if matches!(self.selection, Selection::All) {
+            let file = ScanFile {
+                layout: self.layout,
+                cache: None,
+                ..self.parts
+            };
+            let start = self.row_range.start - self.group_start;
+            (file, start..start + (self.row_range.end - self.row_range.start))
+        } else {
+            (self.parts, self.row_range)
+        };
+        let builder = V2ScanBuilder::new(self.session.clone(), file)
             .with_projection(self.projection)
             .with_some_filter(self.filter)
-            .with_row_range(self.row_range)
+            .with_row_range(row_range)
             .with_selection(self.selection);
         let driver = ScanDriver::new(self.session.handle(), self.concurrency, self.ordered);
         let stream = driver.run(builder);
@@ -633,6 +670,21 @@ impl Partition for RowGroupPartition {
             self.dtype, stream,
         )))
     }
+}
+
+/// The layouts of `root`'s row groups, in file order.
+///
+/// `root` is the file layout `crate::scan_file` builds: a file over a chunked layout with one chunk
+/// per row group.
+fn row_group_layouts(root: &LayoutRef) -> VortexResult<Vec<LayoutRef>> {
+    let children = root.children()?;
+    let [chunked] = children.as_slice() else {
+        vortex_bail!(
+            "expected the Parquet file layout to have one child, found {}",
+            children.len()
+        );
+    };
+    chunked.children()
 }
 
 /// Ends `stream` after `limit` rows, slicing the batch that crosses it.
