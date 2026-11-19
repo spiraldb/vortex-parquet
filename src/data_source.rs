@@ -16,6 +16,7 @@ use futures::future;
 use futures::stream;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
+use parquet::file::metadata::ParquetMetaData;
 use vortex::array::ArrayRef;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ConstantArray;
@@ -42,6 +43,7 @@ use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
 use vortex::layout::scan::v2::ScanFile;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::fns::binary::Binary;
+use vortex::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::scalar_fn::fns::literal::Literal;
 use vortex::scalar_fn::fns::operators::CompareOperator;
@@ -63,6 +65,7 @@ use crate::PreparedFile;
 use crate::pages::single_leaf_index;
 use crate::statistics::max_scalar;
 use crate::statistics::min_scalar;
+use crate::statistics::row_group_falsified;
 
 /// A layout-backed Parquet source with footer-derived file statistics.
 pub(crate) struct ParquetDataSource {
@@ -439,7 +442,22 @@ impl DataSource for ParquetDataSource {
                 .div_ceil(get_available_parallelism().unwrap_or(1))
                 .max(1)
         });
+        // V2 zone pruning skips dynamic conjuncts for scans of one chunk, which is every row group
+        // of a typical file, so a TopN or join bound that tightened after the scan began would
+        // never prune a row group. Each partition checks its footer statistics against the
+        // filter's current values when it starts instead.
+        let dynamic = filter
+            .as_ref()
+            .filter(|filter| DynamicExprUpdates::new(filter).is_some())
+            .map(|filter| {
+                Arc::new(DynamicPruning {
+                    filter: filter.clone(),
+                    dtype: self.dtype.clone(),
+                    metadata: Arc::clone(&self.prepared.ctx.metadata),
+                })
+            });
         Ok(Box::new(RowGroupScan {
+            dynamic,
             parts,
             session: self.session.clone(),
             dtype,
@@ -471,7 +489,16 @@ fn intersect(left: &Range<u64>, right: &Range<u64>) -> Option<Range<u64>> {
     (start < end).then_some(start..end)
 }
 
+/// A filter with dynamic expressions, checked against a row group's footer when it starts.
+struct DynamicPruning {
+    filter: BoundExpression,
+    /// The file's row dtype, which the filter is bound to.
+    dtype: DType,
+    metadata: Arc<ParquetMetaData>,
+}
+
 struct RowGroupScan {
+    dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
     session: VortexSession,
     dtype: DType,
@@ -516,6 +543,7 @@ impl Stream for RowGroupScan {
             *limit = limit.saturating_sub(selected_rows);
         }
         Poll::Ready(Some(Ok(Box::new(RowGroupPartition {
+            dynamic: self.dynamic.clone(),
             parts: self.parts.clone(),
             session: self.session.clone(),
             dtype: self.dtype.clone(),
@@ -538,6 +566,7 @@ impl Stream for RowGroupScan {
 
 /// One row group, scanned through the V2 plan its layout lowers to.
 struct RowGroupPartition {
+    dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
     session: VortexSession,
     dtype: DType,
@@ -575,6 +604,20 @@ impl Partition for RowGroupPartition {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
+        if let Some(dynamic) = &self.dynamic
+            && row_group_falsified(
+                &dynamic.filter,
+                &dynamic.dtype,
+                &dynamic.metadata,
+                self.row_group,
+                &self.session,
+            )?
+        {
+            return Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+                self.dtype,
+                stream::empty(),
+            )));
+        }
         let builder = V2ScanBuilder::new(self.session.clone(), self.parts.clone())
             .with_projection(self.projection)
             .with_some_filter(self.filter)
