@@ -6,317 +6,14 @@
 //! Other expressions use the aggregate properties requested by [`BoundExpression::falsify`],
 //! leaving unsupported expressions, dynamic values, and floating-point semantics to Vortex.
 
-#[cfg(test)]
-use std::cmp::Ordering;
-
-#[cfg(test)]
-use parquet::data_type::ByteArray;
-#[cfg(test)]
-use parquet::data_type::FixedLenByteArray;
-#[cfg(test)]
-use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnDescriptor;
-use vortex::aggregate_fn::AggregateFnRef;
-use vortex::aggregate_fn::fns::all_non_null::AllNonNull;
-use vortex::aggregate_fn::fns::all_null::AllNull;
-use vortex::aggregate_fn::fns::max::Max;
-use vortex::aggregate_fn::fns::min::Min;
-use vortex::aggregate_fn::fns::null_count::NullCount;
-use vortex::array::IntoArray;
-use vortex::array::VortexSessionExecute;
-use vortex::array::arrays::ConstantArray;
-use vortex::array::builtins::ArrayBuiltins;
-use vortex::array::scalar_fn::internal::row_count::contains_row_count;
-use vortex::array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex::buffer::ByteBuffer;
-use parquet::file::metadata::ParquetMetaData;
 use vortex::dtype::DType;
-use vortex::dtype::StructFields;
-use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-#[cfg(test)]
-use vortex::dtype::extension::Matcher;
-use vortex::error::VortexResult;
-use vortex::expr::BoundExpression;
-use vortex::expr::bound::lit;
-use vortex::expr::stats::bind::StatBinder;
-use vortex::expr::stats::bind::bind_stats;
-use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
-#[cfg(test)]
-use vortex::extension::datetime::AnyTemporal;
-use vortex::mask::Mask;
 use vortex::scalar::DecimalValue;
 use vortex::scalar::Scalar;
-#[cfg(test)]
-use vortex::scalar_fn::fns::between::Between;
-#[cfg(test)]
-use vortex::scalar_fn::fns::binary::Binary;
-#[cfg(test)]
-use vortex::scalar_fn::fns::literal::Literal;
-#[cfg(test)]
-use vortex::scalar_fn::fns::operators::CompareOperator;
-use vortex::session::VortexSession;
-
-/// Footer or page statistics over one flat physical Parquet column.
-pub(crate) struct ParquetStats<'a> {
-    pub(crate) dtype: &'a DType,
-    pub(crate) statistics: &'a Statistics,
-    pub(crate) row_count: u64,
-    /// Whether the min/max bytes use an ordering compatible with `dtype`.
-    ///
-    /// Null counts remain useful when this is false. Older Parquet files wrote min/max using the
-    /// deprecated fields, whose ordering is undefined for byte arrays and unsigned values; binding
-    /// those bounds can prune rows that actually match.
-    pub(crate) min_max_safe: bool,
-}
-
-impl StatBinder for ParquetStats<'_> {
-    fn bind_aggregate(
-        &self,
-        input: &BoundExpression,
-        aggregate_fn: &AggregateFnRef,
-        _stat_dtype: &DType,
-    ) -> VortexResult<Option<BoundExpression>> {
-        if !input.is_root() {
-            return Ok(None);
-        }
-        Ok(self.bind_leaf(aggregate_fn))
-    }
-}
-
-impl ParquetStats<'_> {
-    /// Binds `aggregate_fn` of this column to its statistic, when the footer has it.
-    fn bind_leaf(&self, aggregate_fn: &AggregateFnRef) -> Option<BoundExpression> {
-        if aggregate_fn.is::<NullCount>() {
-            return self.statistics.null_count_opt().map(lit);
-        }
-        if aggregate_fn.is::<AllNull>() {
-            return self
-                .statistics
-                .null_count_opt()
-                .map(|count| lit(count == self.row_count));
-        }
-        if aggregate_fn.is::<AllNonNull>() {
-            return self
-                .statistics
-                .null_count_opt()
-                .map(|count| lit(count == 0));
-        }
-        if aggregate_fn.is::<Min>() {
-            return self
-                .min_max_safe
-                .then(|| stat_scalar(self.statistics, self.dtype, Bound::Min))
-                .flatten()
-                .map(lit);
-        }
-        if aggregate_fn.is::<Max>() {
-            return self
-                .min_max_safe
-                .then(|| stat_scalar(self.statistics, self.dtype, Bound::Max))
-                .flatten()
-                .map(lit);
-        }
-
-        None
-    }
-}
-
-#[cfg(test)]
-/// Returns whether Parquet's statistics prove `expr` false for this entire statistics scope.
-pub(crate) fn can_prune(
-    expr: &BoundExpression,
-    stats: &ParquetStats<'_>,
-    session: &VortexSession,
-) -> VortexResult<bool> {
-    if let Some(prunes) = direct_comparison_prunes(expr, stats) {
-        return Ok(prunes);
-    }
-    if let Some(prunes) = direct_between_prunes(expr, stats) {
-        return Ok(prunes);
-    }
-    falsified(expr, stats, stats.dtype, stats.row_count, session)
-}
-
-/// Whether `binder`'s statistics prove `expr`, over `row_count` rows of `dtype`, false for every
-/// row. Dynamic expressions are evaluated at their current values.
-fn falsified(
-    expr: &BoundExpression,
-    binder: &dyn StatBinder,
-    dtype: &DType,
-    row_count: u64,
-    session: &VortexSession,
-) -> VortexResult<bool> {
-    let Some(predicate) = expr.falsify(session)? else {
-        return Ok(false);
-    };
-    let predicate = bind_stats(predicate, binder)?;
-    let input = ConstantArray::new(Scalar::null(dtype.as_nullable()), 1).into_array();
-    let mut applied = input.apply_bound(&predicate)?;
-    if contains_row_count(&applied) {
-        let count = ConstantArray::new(row_count, 1).into_array();
-        applied = substitute_row_count(applied, &count)?;
-    }
-    let mut ctx = session.create_execution_ctx();
-    let mask = applied.fill_null(false)?.execute::<Mask>(&mut ctx)?;
-    Ok(mask.value(0))
-}
-
-/// The footer statistics of one row group, for a filter over the whole row.
-///
-/// Binds the statistics of each flat top-level field the filter reads, under the same trust rules
-/// as the scan's footer zone maps.
-pub(crate) struct RowGroupStats<'a> {
-    pub(crate) fields: &'a StructFields,
-    pub(crate) metadata: &'a ParquetMetaData,
-    pub(crate) row_group: usize,
-}
-
-impl StatBinder for RowGroupStats<'_> {
-    fn bind_aggregate(
-        &self,
-        input: &BoundExpression,
-        aggregate_fn: &AggregateFnRef,
-        _stat_dtype: &DType,
-    ) -> VortexResult<Option<BoundExpression>> {
-        let Some(name) = input
-            .as_opt::<GetItem>()
-            .filter(|_| input.child(0).is_root())
-        else {
-            return Ok(None);
-        };
-        let Some(index) = self.fields.find(name) else {
-            return Ok(None);
-        };
-        let Some(dtype) = self.fields.field_by_index(index) else {
-            return Ok(None);
-        };
-        let schema = self.metadata.file_metadata().schema_descr();
-        let Some(leaf) = crate::pages::single_leaf_index(schema, index) else {
-            return Ok(None);
-        };
-        let descriptor = schema.column(leaf);
-        if !crate::pages::direct_dtype(&dtype, descriptor.physical_type()) {
-            return Ok(None);
-        }
-        let row_group = self.metadata.row_group(self.row_group);
-        let Some(statistics) = row_group.column(leaf).statistics() else {
-            return Ok(None);
-        };
-        Ok(ParquetStats {
-            dtype: &dtype,
-            statistics,
-            row_count: u64::try_from(row_group.num_rows())?,
-            min_max_safe: min_max_trustworthy(statistics, descriptor.as_ref()),
-        }
-        .bind_leaf(aggregate_fn))
-    }
-}
-
-/// Whether row group `row_group`'s footer statistics prove `filter`, over a row of `dtype`, false
-/// for every row, evaluating any dynamic expression at its current value.
-pub(crate) fn row_group_falsified(
-    filter: &BoundExpression,
-    dtype: &DType,
-    metadata: &ParquetMetaData,
-    row_group: usize,
-    session: &VortexSession,
-) -> VortexResult<bool> {
-    let Some(fields) = dtype.as_struct_fields_opt() else {
-        return Ok(false);
-    };
-    let row_count = u64::try_from(metadata.row_group(row_group).num_rows())?;
-    let binder = RowGroupStats {
-        fields,
-        metadata,
-        row_group,
-    };
-    falsified(filter, &binder, dtype, row_count, session)
-}
-
-#[cfg(test)]
-/// Evaluate the bounds proof for supported root/literal comparisons without building a generic
-/// stats expression. Those rewrites repeat these same endpoint comparisons, including when the
-/// bounds cannot disprove the predicate. Null rows cannot satisfy these comparisons either.
-/// Temporal values use their integer storage order after checking that units and timezone match.
-/// Floats, other extensions and other expressions keep the generic rewrite path.
-fn direct_comparison_prunes(expr: &BoundExpression, stats: &ParquetStats<'_>) -> Option<bool> {
-    if !stats.min_max_safe
-        || !match stats.dtype {
-            DType::Primitive(ptype, _) => ptype.is_int(),
-            DType::Bool(_) | DType::Utf8(_) | DType::Binary(_) | DType::Decimal(..) => true,
-            DType::Extension(ext) => AnyTemporal::try_match(ext).is_some(),
-            _ => false,
-        }
-    {
-        return None;
-    }
-    let operator = expr.as_opt::<Binary>()?.to_compare_operator()?;
-    let (operator, value) = if expr.child(0).is_root() {
-        (operator, expr.child(1).as_opt::<Literal>()?)
-    } else if expr.child(1).is_root() {
-        (operator.swap(), expr.child(0).as_opt::<Literal>()?)
-    } else {
-        return None;
-    };
-    if value.is_null() || !value.dtype().eq_ignore_nullability(stats.dtype) {
-        return None;
-    }
-    let minimum = || min_scalar(stats.statistics, stats.dtype)?.partial_cmp(value);
-    let maximum = || max_scalar(stats.statistics, stats.dtype)?.partial_cmp(value);
-    Some(match operator {
-        CompareOperator::Eq => {
-            minimum() == Some(Ordering::Greater) || maximum() == Some(Ordering::Less)
-        }
-        CompareOperator::NotEq => {
-            minimum() == Some(Ordering::Equal) && maximum() == Some(Ordering::Equal)
-        }
-        CompareOperator::Lt => minimum().is_some_and(|order| order != Ordering::Less),
-        CompareOperator::Lte => minimum() == Some(Ordering::Greater),
-        CompareOperator::Gt => maximum().is_some_and(|order| order != Ordering::Greater),
-        CompareOperator::Gte => maximum() == Some(Ordering::Less),
-    })
-}
-
-#[cfg(test)]
-/// Check a root/literal interval directly, preserving the generic path for Boolean expressions.
-#[inline(never)]
-fn direct_between_prunes(expr: &BoundExpression, stats: &ParquetStats<'_>) -> Option<bool> {
-    if !stats.min_max_safe
-        || !match stats.dtype {
-            DType::Primitive(ptype, _) => ptype.is_int(),
-            DType::Bool(_) | DType::Utf8(_) | DType::Binary(_) | DType::Decimal(..) => true,
-            DType::Extension(ext) => AnyTemporal::try_match(ext).is_some(),
-            _ => false,
-        }
-    {
-        return None;
-    }
-    if let Some(options) = expr.as_opt::<Between>() {
-        if !expr.child(0).is_root() {
-            return None;
-        }
-        let lower = expr.child(1).as_opt::<Literal>()?;
-        let upper = expr.child(2).as_opt::<Literal>()?;
-        if lower.is_null()
-            || upper.is_null()
-            || !lower.dtype().eq_ignore_nullability(stats.dtype)
-            || !upper.dtype().eq_ignore_nullability(stats.dtype)
-        {
-            return None;
-        }
-        let below = max_scalar(stats.statistics, stats.dtype)?.partial_cmp(lower);
-        let above = min_scalar(stats.statistics, stats.dtype)?.partial_cmp(upper);
-        return Some(
-            below == Some(Ordering::Less)
-                || (options.lower_strict.is_strict() && below == Some(Ordering::Equal))
-                || above == Some(Ordering::Greater)
-                || (options.upper_strict.is_strict() && above == Some(Ordering::Equal)),
-        );
-    }
-    None
-}
 
 #[derive(Clone, Copy)]
 enum Bound {
@@ -410,87 +107,6 @@ fn selected<'a, T>(min: Option<&'a T>, max: Option<&'a T>, bound: Bound) -> Opti
     }
 }
 
-#[cfg(test)]
-/// Builds typed statistics for one decoded parquet-rs column-index entry.
-///
-/// parquet-rs uses its own compact-Thrift decoder for column indexes (not the generated `thrift`
-/// crate protocol used by older APIs), so pruning consumes its typed metadata directly. Besides
-/// avoiding a second conversion, this handles compact boolean-list encodings that the generated
-/// protocol rejects as malformed.
-pub(crate) fn page_index_statistics(
-    index: &ColumnIndexMetaData,
-    page: usize,
-    null_count: Option<u64>,
-) -> Option<Statistics> {
-    Some(match index {
-        ColumnIndexMetaData::NONE => return None,
-        ColumnIndexMetaData::BOOLEAN(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::INT32(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::INT64(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::INT96(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::FLOAT(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::DOUBLE(index) => Statistics::new(
-            index.min_value(page).copied(),
-            index.max_value(page).copied(),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::BYTE_ARRAY(index) => Statistics::new(
-            index
-                .min_value(page)
-                .map(|value| ByteArray::from(value.to_vec())),
-            index
-                .max_value(page)
-                .map(|value| ByteArray::from(value.to_vec())),
-            None,
-            null_count,
-            false,
-        ),
-        ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index) => Statistics::new(
-            index
-                .min_value(page)
-                .map(|value| FixedLenByteArray::from(value.to_vec())),
-            index
-                .max_value(page)
-                .map(|value| FixedLenByteArray::from(value.to_vec())),
-            None,
-            null_count,
-            false,
-        ),
-    })
-}
-
 /// Whether a column chunk's `min`/`max` may be trusted as bounds in the column's **logical** domain.
 ///
 /// # Why the obvious check is not enough
@@ -514,6 +130,301 @@ pub(crate) fn page_index_statistics(
 pub(crate) fn min_max_trustworthy(statistics: &Statistics, descriptor: &ColumnDescriptor) -> bool {
     !statistics.is_min_max_deprecated()
         || (statistics.is_min_max_backwards_compatible() && descriptor.sort_order().is_signed())
+}
+
+#[cfg(test)]
+/// The footer-statistics pruning proof the V1 reader evaluated per row group and per page.
+///
+/// The V2 scan prunes through [`FooterZones`](crate::plan::FooterZones) instead, over the same
+/// [`min_scalar`]/[`max_scalar`] bounds. This proof is kept as the oracle the tests below check
+/// those bounds against: it is the simplest place to say which predicates a bound may disprove.
+mod oracle {
+    #![allow(unreachable_pub)]
+    pub(super) use std::cmp::Ordering;
+
+    pub(super) use parquet::data_type::ByteArray;
+    pub(super) use parquet::data_type::FixedLenByteArray;
+    pub(super) use parquet::file::page_index::column_index::ColumnIndexMetaData;
+    pub(super) use vortex::aggregate_fn::AggregateFnRef;
+    pub(super) use vortex::aggregate_fn::fns::all_non_null::AllNonNull;
+    pub(super) use vortex::aggregate_fn::fns::all_null::AllNull;
+    pub(super) use vortex::aggregate_fn::fns::max::Max;
+    pub(super) use vortex::aggregate_fn::fns::min::Min;
+    pub(super) use vortex::aggregate_fn::fns::null_count::NullCount;
+    pub(super) use vortex::array::IntoArray;
+    pub(super) use vortex::array::VortexSessionExecute;
+    pub(super) use vortex::array::arrays::ConstantArray;
+    pub(super) use vortex::array::builtins::ArrayBuiltins;
+    pub(super) use vortex::array::scalar_fn::internal::row_count::contains_row_count;
+    pub(super) use vortex::array::scalar_fn::internal::row_count::substitute_row_count;
+    pub(super) use vortex::dtype::extension::Matcher;
+    pub(super) use vortex::error::VortexResult;
+    pub(super) use vortex::expr::BoundExpression;
+    pub(super) use vortex::expr::bound::lit;
+    pub(super) use vortex::expr::stats::bind::StatBinder;
+    pub(super) use vortex::expr::stats::bind::bind_stats;
+    pub(super) use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
+    pub(super) use vortex::extension::datetime::AnyTemporal;
+    pub(super) use vortex::mask::Mask;
+    pub(super) use vortex::scalar_fn::fns::between::Between;
+    pub(super) use vortex::scalar_fn::fns::binary::Binary;
+    pub(super) use vortex::scalar_fn::fns::literal::Literal;
+    pub(super) use vortex::scalar_fn::fns::operators::CompareOperator;
+    pub(super) use vortex::session::VortexSession;
+
+    use super::*;
+
+    /// Footer or page statistics over one flat physical Parquet column.
+    pub(super) struct ParquetStats<'a> {
+        pub(crate) dtype: &'a DType,
+        pub(crate) statistics: &'a Statistics,
+        pub(crate) row_count: u64,
+        /// Whether the min/max bytes use an ordering compatible with `dtype`.
+        ///
+        /// Null counts remain useful when this is false. Older Parquet files wrote min/max using the
+        /// deprecated fields, whose ordering is undefined for byte arrays and unsigned values; binding
+        /// those bounds can prune rows that actually match.
+        pub(crate) min_max_safe: bool,
+    }
+
+    impl StatBinder for ParquetStats<'_> {
+        fn bind_aggregate(
+            &self,
+            input: &BoundExpression,
+            aggregate_fn: &AggregateFnRef,
+            _stat_dtype: &DType,
+        ) -> VortexResult<Option<BoundExpression>> {
+            if !input.is_root() {
+                return Ok(None);
+            }
+
+            if aggregate_fn.is::<NullCount>() {
+                return Ok(self.statistics.null_count_opt().map(lit));
+            }
+            if aggregate_fn.is::<AllNull>() {
+                return Ok(self
+                    .statistics
+                    .null_count_opt()
+                    .map(|count| lit(count == self.row_count)));
+            }
+            if aggregate_fn.is::<AllNonNull>() {
+                return Ok(self
+                    .statistics
+                    .null_count_opt()
+                    .map(|count| lit(count == 0)));
+            }
+            if aggregate_fn.is::<Min>() {
+                return Ok(self
+                    .min_max_safe
+                    .then(|| stat_scalar(self.statistics, self.dtype, Bound::Min))
+                    .flatten()
+                    .map(lit));
+            }
+            if aggregate_fn.is::<Max>() {
+                return Ok(self
+                    .min_max_safe
+                    .then(|| stat_scalar(self.statistics, self.dtype, Bound::Max))
+                    .flatten()
+                    .map(lit));
+            }
+
+            Ok(None)
+        }
+    }
+
+    /// Returns whether Parquet's statistics prove `expr` false for this entire statistics scope.
+    pub(super) fn can_prune(
+        expr: &BoundExpression,
+        stats: &ParquetStats<'_>,
+        session: &VortexSession,
+    ) -> VortexResult<bool> {
+        if let Some(prunes) = direct_comparison_prunes(expr, stats) {
+            return Ok(prunes);
+        }
+        if let Some(prunes) = direct_between_prunes(expr, stats) {
+            return Ok(prunes);
+        }
+        let Some(predicate) = expr.falsify(session)? else {
+            return Ok(false);
+        };
+        let predicate = bind_stats(predicate, stats)?;
+        let input = ConstantArray::new(Scalar::null(stats.dtype.as_nullable()), 1).into_array();
+        let mut applied = input.apply_bound(&predicate)?;
+        if contains_row_count(&applied) {
+            let count = ConstantArray::new(stats.row_count, 1).into_array();
+            applied = substitute_row_count(applied, &count)?;
+        }
+        let mut ctx = session.create_execution_ctx();
+        let mask = applied.fill_null(false)?.execute::<Mask>(&mut ctx)?;
+        Ok(mask.value(0))
+    }
+
+    /// Evaluate the bounds proof for supported root/literal comparisons without building a generic
+    /// stats expression. Those rewrites repeat these same endpoint comparisons, including when the
+    /// bounds cannot disprove the predicate. Null rows cannot satisfy these comparisons either.
+    /// Temporal values use their integer storage order after checking that units and timezone match.
+    /// Floats, other extensions and other expressions keep the generic rewrite path.
+    pub(super) fn direct_comparison_prunes(
+        expr: &BoundExpression,
+        stats: &ParquetStats<'_>,
+    ) -> Option<bool> {
+        if !stats.min_max_safe
+            || !match stats.dtype {
+                DType::Primitive(ptype, _) => ptype.is_int(),
+                DType::Bool(_) | DType::Utf8(_) | DType::Binary(_) | DType::Decimal(..) => true,
+                DType::Extension(ext) => AnyTemporal::try_match(ext).is_some(),
+                _ => false,
+            }
+        {
+            return None;
+        }
+        let operator = expr.as_opt::<Binary>()?.to_compare_operator()?;
+        let (operator, value) = if expr.child(0).is_root() {
+            (operator, expr.child(1).as_opt::<Literal>()?)
+        } else if expr.child(1).is_root() {
+            (operator.swap(), expr.child(0).as_opt::<Literal>()?)
+        } else {
+            return None;
+        };
+        if value.is_null() || !value.dtype().eq_ignore_nullability(stats.dtype) {
+            return None;
+        }
+        let minimum = || min_scalar(stats.statistics, stats.dtype)?.partial_cmp(value);
+        let maximum = || max_scalar(stats.statistics, stats.dtype)?.partial_cmp(value);
+        Some(match operator {
+            CompareOperator::Eq => {
+                minimum() == Some(Ordering::Greater) || maximum() == Some(Ordering::Less)
+            }
+            CompareOperator::NotEq => {
+                minimum() == Some(Ordering::Equal) && maximum() == Some(Ordering::Equal)
+            }
+            CompareOperator::Lt => minimum().is_some_and(|order| order != Ordering::Less),
+            CompareOperator::Lte => minimum() == Some(Ordering::Greater),
+            CompareOperator::Gt => maximum().is_some_and(|order| order != Ordering::Greater),
+            CompareOperator::Gte => maximum() == Some(Ordering::Less),
+        })
+    }
+
+    /// Check a root/literal interval directly, preserving the generic path for Boolean expressions.
+    #[inline(never)]
+    pub(super) fn direct_between_prunes(
+        expr: &BoundExpression,
+        stats: &ParquetStats<'_>,
+    ) -> Option<bool> {
+        if !stats.min_max_safe
+            || !match stats.dtype {
+                DType::Primitive(ptype, _) => ptype.is_int(),
+                DType::Bool(_) | DType::Utf8(_) | DType::Binary(_) | DType::Decimal(..) => true,
+                DType::Extension(ext) => AnyTemporal::try_match(ext).is_some(),
+                _ => false,
+            }
+        {
+            return None;
+        }
+        if let Some(options) = expr.as_opt::<Between>() {
+            if !expr.child(0).is_root() {
+                return None;
+            }
+            let lower = expr.child(1).as_opt::<Literal>()?;
+            let upper = expr.child(2).as_opt::<Literal>()?;
+            if lower.is_null()
+                || upper.is_null()
+                || !lower.dtype().eq_ignore_nullability(stats.dtype)
+                || !upper.dtype().eq_ignore_nullability(stats.dtype)
+            {
+                return None;
+            }
+            let below = max_scalar(stats.statistics, stats.dtype)?.partial_cmp(lower);
+            let above = min_scalar(stats.statistics, stats.dtype)?.partial_cmp(upper);
+            return Some(
+                below == Some(Ordering::Less)
+                    || (options.lower_strict.is_strict() && below == Some(Ordering::Equal))
+                    || above == Some(Ordering::Greater)
+                    || (options.upper_strict.is_strict() && above == Some(Ordering::Equal)),
+            );
+        }
+        None
+    }
+
+    /// Builds typed statistics for one decoded parquet-rs column-index entry.
+    ///
+    /// parquet-rs uses its own compact-Thrift decoder for column indexes (not the generated `thrift`
+    /// crate protocol used by older APIs), so pruning consumes its typed metadata directly. Besides
+    /// avoiding a second conversion, this handles compact boolean-list encodings that the generated
+    /// protocol rejects as malformed.
+    pub(super) fn page_index_statistics(
+        index: &ColumnIndexMetaData,
+        page: usize,
+        null_count: Option<u64>,
+    ) -> Option<Statistics> {
+        Some(match index {
+            ColumnIndexMetaData::NONE => return None,
+            ColumnIndexMetaData::BOOLEAN(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::INT32(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::INT64(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::INT96(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::FLOAT(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::DOUBLE(index) => Statistics::new(
+                index.min_value(page).copied(),
+                index.max_value(page).copied(),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::BYTE_ARRAY(index) => Statistics::new(
+                index
+                    .min_value(page)
+                    .map(|value| ByteArray::from(value.to_vec())),
+                index
+                    .max_value(page)
+                    .map(|value| ByteArray::from(value.to_vec())),
+                None,
+                null_count,
+                false,
+            ),
+            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index) => Statistics::new(
+                index
+                    .min_value(page)
+                    .map(|value| FixedLenByteArray::from(value.to_vec())),
+                index
+                    .max_value(page)
+                    .map(|value| FixedLenByteArray::from(value.to_vec())),
+                None,
+                null_count,
+                false,
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +467,7 @@ mod tests {
     use vortex::scalar_fn::fns::between::BetweenOptions;
     use vortex::scalar_fn::fns::between::StrictComparison;
 
+    use super::oracle::*;
     use super::*;
 
     fn prunes(

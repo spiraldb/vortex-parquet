@@ -16,7 +16,6 @@ use futures::future;
 use futures::stream;
 use futures::stream::BoxStream;
 use parking_lot::Mutex;
-use parquet::file::metadata::ParquetMetaData;
 use vortex::array::ArrayRef;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ConstantArray;
@@ -44,7 +43,6 @@ use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
 use vortex::layout::scan::v2::ScanFile;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::scalar_fn::fns::literal::Literal;
 use vortex::scalar_fn::fns::operators::CompareOperator;
@@ -57,8 +55,10 @@ use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
 use vortex::scan::execution::driver::ScanDriver;
-use vortex::scan::prepare::ScanCache;
 use vortex::scan::selection::Selection;
+use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
+use vortex::mask::AllOr;
+use vortex::buffer::Buffer;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
 use vortex::utils::parallelism::get_available_parallelism;
@@ -67,7 +67,6 @@ use crate::PreparedFile;
 use crate::pages::single_leaf_index;
 use crate::statistics::max_scalar;
 use crate::statistics::min_scalar;
-use crate::statistics::row_group_falsified;
 
 /// A layout-backed Parquet source with footer-derived file statistics.
 pub(crate) struct ParquetDataSource {
@@ -402,14 +401,8 @@ impl DataSource for ParquetDataSource {
             scan_request.filter = self.unsatisfied_filter(filter, &mut HashMap::new())?;
         }
 
-        let file = self.scan_file()?;
-        let row_group_layouts: Arc<[LayoutRef]> = row_group_layouts(&file.layout)?.into();
-        // Shared by the partitions that scan the whole file's plan, as Vortex's own file scans
-        // share one cache per scan. See `RowGroupPartition::execute` for when that happens.
-        let parts = ScanFile {
-            cache: Some(ScanCache::default()),
-            ..file
-        };
+        let parts = self.scan_file()?;
+        let row_group_layouts: Arc<[LayoutRef]> = row_group_layouts(&parts.layout)?.into();
         // Bound once in the file scope and shared by every row group's scan. Optimized as Vortex's
         // own data sources do: engines hand over expressions over their projected row, such as
         // DataFusion's `pack(id: $.id).id >= 4000`, and zone pruning only sees through the
@@ -451,22 +444,7 @@ impl DataSource for ParquetDataSource {
                 .div_ceil(get_available_parallelism().unwrap_or(1))
                 .max(1)
         });
-        // V2 zone pruning skips dynamic conjuncts for scans of one chunk, which is every row group
-        // of a typical file, so a TopN or join bound that tightened after the scan began would
-        // never prune a row group. Each partition checks its footer statistics against the
-        // filter's current values when it starts instead.
-        let dynamic = filter
-            .as_ref()
-            .filter(|filter| DynamicExprUpdates::new(filter).is_some())
-            .map(|filter| {
-                Arc::new(DynamicPruning {
-                    filter: filter.clone(),
-                    dtype: self.dtype.clone(),
-                    metadata: Arc::clone(&self.prepared.ctx.metadata),
-                })
-            });
         Ok(Box::new(RowGroupScan {
-            dynamic,
             parts,
             row_group_layouts,
             row_group_ranges: Arc::clone(&self.row_groups),
@@ -500,16 +478,7 @@ fn intersect(left: &Range<u64>, right: &Range<u64>) -> Option<Range<u64>> {
     (start < end).then_some(start..end)
 }
 
-/// A filter with dynamic expressions, checked against a row group's footer when it starts.
-struct DynamicPruning {
-    filter: BoundExpression,
-    /// The file's row dtype, which the filter is bound to.
-    dtype: DType,
-    metadata: Arc<ParquetMetaData>,
-}
-
 struct RowGroupScan {
-    dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
     /// Each row group's own layout, indexed by row group.
     row_group_layouts: Arc<[LayoutRef]>,
@@ -558,7 +527,6 @@ impl Stream for RowGroupScan {
             *limit = limit.saturating_sub(selected_rows);
         }
         Poll::Ready(Some(Ok(Box::new(RowGroupPartition {
-            dynamic: self.dynamic.clone(),
             parts: self.parts.clone(),
             layout: Arc::clone(&self.row_group_layouts[row_group]),
             group_start: self.row_group_ranges[row_group].start,
@@ -583,7 +551,6 @@ impl Stream for RowGroupScan {
 
 /// One row group, scanned through the V2 plan its layout lowers to.
 struct RowGroupPartition {
-    dynamic: Option<Arc<DynamicPruning>>,
     parts: ScanFile,
     /// This row group's own layout.
     layout: LayoutRef,
@@ -625,41 +592,21 @@ impl Partition for RowGroupPartition {
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
-        if let Some(dynamic) = &self.dynamic
-            && row_group_falsified(
-                &dynamic.filter,
-                &dynamic.dtype,
-                &dynamic.metadata,
-                self.row_group,
-                &self.session,
-            )?
-        {
-            return Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
-                self.dtype,
-                stream::empty(),
-            )));
-        }
-        // Planning the row group's own layout keeps each partition's planning proportional to one
-        // row group. Planning the file's root instead re-optimizes every row group's plan in each
-        // partition: the plans are cached per scan, but every partition starts together and misses
-        // the cache, which made planning a TPC-H query cost more than decoding it. A selection is
-        // in file rows, so it keeps the file's plan rather than being translated.
-        let (file, row_range) = if matches!(self.selection, Selection::All) {
-            let file = ScanFile {
-                layout: self.layout,
-                cache: None,
-                ..self.parts
-            };
-            let start = self.row_range.start - self.group_start;
-            (file, start..start + (self.row_range.end - self.row_range.start))
-        } else {
-            (self.parts, self.row_range)
+        // Each partition plans its own row group's layout, in that row group's rows. Planning the
+        // file's root instead re-optimizes every row group's plan in each partition, which made
+        // planning a TPC-H query cost more than decoding it.
+        let local_start = self.row_range.start - self.group_start;
+        let local_rows = local_start..local_start + (self.row_range.end - self.row_range.start);
+        let selection = row_group_selection(&self.selection, &self.row_range, local_start)?;
+        let file = ScanFile {
+            layout: self.layout,
+            ..self.parts
         };
         let builder = V2ScanBuilder::new(self.session.clone(), file)
             .with_projection(self.projection)
             .with_some_filter(self.filter)
-            .with_row_range(row_range)
-            .with_selection(self.selection);
+            .with_row_range(local_rows)
+            .with_selection(selection);
         let driver = ScanDriver::new(self.session.handle(), self.concurrency, self.ordered);
         let stream = driver.run(builder);
         let stream = match self.limit {
@@ -685,6 +632,32 @@ fn row_group_layouts(root: &LayoutRef) -> VortexResult<Vec<LayoutRef>> {
         );
     };
     chunked.children()
+}
+
+/// Translates `selection`, in file rows, to the rows of a row group's own layout.
+///
+/// `file_rows` are the partition's rows in the file and `local_start` is where they start within
+/// the row group.
+fn row_group_selection(
+    selection: &Selection,
+    file_rows: &Range<u64>,
+    local_start: u64,
+) -> VortexResult<Selection> {
+    if matches!(selection, Selection::All) {
+        return Ok(Selection::All);
+    }
+    let row_mask = selection.row_mask(file_rows);
+    let indices = match row_mask.mask().indices() {
+        AllOr::All => return Ok(Selection::All),
+        AllOr::None => Buffer::empty(),
+        AllOr::Some(indices) => indices
+            .iter()
+            .map(|&index| local_start + index as u64)
+            .collect(),
+    };
+    Ok(Selection::IncludeByIndex(StrictSortedBuffer::try_new(
+        indices,
+    )?))
 }
 
 /// Ends `stream` after `limit` rows, slicing the batch that crosses it.
@@ -759,5 +732,42 @@ impl Partition for EmptyScan {
             self.dtype,
             stream::iter([Ok(array)]),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indices(selection: &Selection) -> Vec<u64> {
+        match selection {
+            Selection::IncludeByIndex(indices) => indices.iter().copied().collect(),
+            _ => panic!("expected an include-by-index selection"),
+        }
+    }
+
+    /// A partition covering file rows 105..120 of a row group that starts at file row 100 scans
+    /// that row group's rows 5..20, so a file-row selection must land on the same local rows.
+    #[test]
+    fn selections_shift_into_row_group_rows() -> VortexResult<()> {
+        let file_rows = 105..120;
+        let include = Selection::IncludeByIndex(StrictSortedBuffer::try_new(Buffer::from_iter([
+            3u64, 105, 110, 119, 120,
+        ]))?);
+        assert_eq!(
+            indices(&row_group_selection(&include, &file_rows, 5)?),
+            [5, 10, 19]
+        );
+
+        let exclude = Selection::ExcludeByIndex(StrictSortedBuffer::try_new(Buffer::from_iter(
+            106u64..120,
+        ))?);
+        assert_eq!(indices(&row_group_selection(&exclude, &file_rows, 5)?), [5]);
+
+        let none = Selection::IncludeByIndex(StrictSortedBuffer::try_new(Buffer::from_iter([
+            1u64,
+        ]))?);
+        assert!(indices(&row_group_selection(&none, &file_rows, 5)?).is_empty());
+        Ok(())
     }
 }
