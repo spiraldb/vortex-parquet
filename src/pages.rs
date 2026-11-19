@@ -652,9 +652,11 @@ macro_rules! parquet_page_encoding {
                     && let Some(values) = binary_dictionary_values(array.data())?
                 {
                     let codes = decode_dictionary_codes(array.data(), values.len())?;
+                    let values_utf8 = dictionary_is_utf8(&values)?;
                     let dictionary = DictArray::try_new(codes, values)?.into_array();
                     return Ok(ExecutionResult::done(materialize_dictionary_bytes(
                         dictionary,
+                        values_utf8,
                         array.dtype(),
                         ctx,
                     )?));
@@ -2199,15 +2201,60 @@ fn binary_dictionary_values(data: &ParquetPageData) -> VortexResult<Option<Array
     ))
 }
 
+/// Whether every entry of a dictionary page is valid UTF-8, checked at most once per dictionary.
+///
+/// A column chunk's data pages share one dictionary, so the check is remembered on the
+/// dictionary's decoded bytes. A dictionary with an invalid entry is not an error here: only the
+/// entries a page references must be valid, which `materialize_dictionary_bytes` then checks.
+fn dictionary_is_utf8(values: &ArrayRef) -> VortexResult<bool> {
+    let Some(page) = values.as_opt::<ParquetPlain>() else {
+        return Ok(false);
+    };
+    let ByteValues::Plain {
+        buffer,
+        views,
+        utf8_validated,
+    } = &decoded_byte_values(page.data())?.values
+    else {
+        return Ok(false);
+    };
+    if utf8_validated.get().is_none() {
+        if validate_plain_utf8(buffer, views.len()).is_err() {
+            return Ok(false);
+        }
+        utf8_validated.get_or_init(|| ());
+    }
+    Ok(true)
+}
+
 /// Gathers dictionary views before validating the selected logical string values.
+///
+/// `values_utf8` says every dictionary entry is valid UTF-8, so every gathered view is too and
+/// the per-row check is skipped. Without it, only the entries the page references are checked.
 fn materialize_dictionary_bytes(
     dictionary: ArrayRef,
+    values_utf8: bool,
     dtype: &DType,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let gathered = dictionary.execute::<VarBinViewArray>(ctx)?;
     if matches!(dtype, DType::Binary(_)) {
         return Ok(gathered.into_array());
+    }
+    if values_utf8 && gathered.dtype().nullability() == dtype.nullability() {
+        let parts = gathered.into_data_parts();
+        // SAFETY: the views were gathered from a validated binary array, so their lengths,
+        // offsets and buffer indices are sound, and every entry they can reference is valid
+        // UTF-8. Only the logical dtype changes.
+        return Ok(unsafe {
+            VarBinViewArray::new_handle_unchecked(
+                parts.views,
+                parts.buffers,
+                dtype.clone(),
+                parts.validity,
+            )
+        }
+        .into_array());
     }
     // Only dictionary entries referenced by this page's nonnull codes are checked as UTF-8.
     let parts = gathered.into_data_parts();
