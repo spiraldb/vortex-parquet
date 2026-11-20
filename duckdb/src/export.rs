@@ -305,6 +305,16 @@ struct Column {
     kind: Kind,
 }
 
+/// The most values a dictionary may have and still be exported as a DuckDB dictionary vector.
+///
+/// DuckDB sizes a dictionary child's validity mask to its standard vector size wherever it
+/// rebuilds one, as TopN's boundary check does, so a code past that size indexes outside the mask
+/// and fails an internal assertion. Larger dictionaries are exported flat.
+fn max_dictionary_len() -> Result<usize> {
+    // SAFETY: a pure query of a compile-time DuckDB constant.
+    Ok(usize::try_from(unsafe { ffi::duckdb_vector_size() })?)
+}
+
 /// Stop lazy execution as soon as an encoding supported by this exporter becomes visible.
 struct Exportable;
 impl Matcher for Exportable {
@@ -400,6 +410,7 @@ impl Column {
                 });
             }
             if let Some(a) = array.as_opt::<Dict>()
+                && a.values().len() <= max_dictionary_len()?
                 && a.codes().validity()?.execute_mask(len, ctx)?.all_true()
             {
                 let key = a.values().addr();

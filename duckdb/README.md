@@ -107,9 +107,10 @@ platforms bypass this cache. Cached entries retain no file handles or decoded co
 use the same file-version key as the footer, and multi-file scans merge every file's bounds;
 any missing bound keeps the combined range unknown.
 Each new file version validates all footer ranges; unchanged versions reuse that validation and
-the converted Arrow/Vortex schema. Scan layouts are built only after projection and filter
-columns are known. Filter-only fields and intermediate projection scopes remain available. Footer
-counts need no scan layouts; `open_file` still exposes the complete physical hierarchy.
+the converted Arrow/Vortex schema. The scan layout is built once per file on the first scan and
+shared by every scan after it; footer counts need none. `ParquetFormat::open` exposes the complete
+physical hierarchy. Dictionaries larger than DuckDB's vector size are exported flat, because
+DuckDB rebuilds a dictionary child's validity at its vector size in operators such as TopN.
 The exporter follows [`vortex-duckdb`](https://github.com/vortex-data/vortex/tree/ead3ef34728e467642e5b149db3e69767e1d5ac1/vortex-duckdb/src/exporter):
 primitive buffers and long-string payloads are referenced through DuckDB-owned shared buffers;
 constants, dictionaries, and chunk boundaries retain their physical structure. Decimal widths are

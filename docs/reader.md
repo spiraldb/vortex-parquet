@@ -19,8 +19,19 @@ ParquetFile
 Opening reads exactly the eight-byte tail and serialized footer metadata. It never reads page-index,
 page-header, or payload bytes. The footer's index locations select the indexed-pages layout; without
 an offset index the header-pages layout defers the sequential header walk until the column chunk is
-actually read. `ParquetFormat::open_file` returns both the inspectable root layout and its reader;
-`ParquetFormat::open` returns just the reader.
+actually read. `ParquetFormat::open` returns a Vortex V2 `ScanFile`: the inspectable root layout,
+the byte location of every segment the layouts name, and a placed segment reader over the file.
+
+Scans run on Vortex's planner-driven (V2) executor. The file and row-group layouts lower to their
+children's plans, so a file becomes a `Concat` of row groups, each a `Pack` of fields. Each
+`ParquetField` lowers to `vortex.parquet.plan.field_scan`, a leaf that reads the field's
+column-chunk segment and decodes it, under a `LegacyStats` zone map built from the row group's
+footer statistics (`vortex.parquet.plan.footer_zones`). The column-chunk and page-set layouts
+describe the file for inspection only. The session's I/O scheduler coalesces, deduplicates and
+retains segment reads. A field's decode is shared, through the format's decode cache, by every plan
+over it: each filter conjunct, the projection, and every scan chunk of the row group. The leaf
+reads whole column chunks; page-index pruning, Bloom-filter pruning and page-granular reads are not
+yet expressed as plans (spiraldb/vortex-parquet#6).
 
 For a flat field, each compressed data page becomes a lazy `vortex.parquet.page` array. Constructing
 the array parses only its header and retains its compressed payload, dictionary page,
@@ -69,14 +80,12 @@ canonical values, so prior row selection does not prevent this pushdown.
 
 ## Pushdown
 
-At the `ParquetField` node, trusted endpoints can directly disprove simple column-to-literal
-comparisons for integers, booleans, strings, binary values, and decimals. Inconclusive and other
-predicates use Vortex's `Expression::falsify`, which requests aggregate properties such as min, max, null count, all-null, and
-all-non-null. The reader binds those properties first to column-chunk statistics already present in
-the footer. If the row group survives and both page indexes exist, it lazily reads the offset and
-column indexes, binds the same properties per page, and expands the page decisions into Vortex's row
-mask. Compound, null, dynamic-comparison, floating-point, and supported string-prefix proofs
-continue to use Vortex's shared rules.
+Each flat field's footer min, max and null count form a one-zone statistics table under the field's
+leaf. Vortex's zone pruning falsifies the filter against it, so a row group whose statistics
+disprove the filter is neither read nor decoded. Bounds are only used when trustworthy: deprecated
+min/max fields are dropped unless their ordering is signed, and decimal bounds outside the declared
+precision are dropped. Page-index and Bloom-filter pruning are not yet expressed on the V2 path
+(spiraldb/vortex-parquet#6).
 
 Dictionary pages reduce to Vortex `DictArray` on demand. Vortex's generic dictionary rule then decides
 whether to push a scalar function into the distinct values using scalar-function fallibility and
@@ -88,21 +97,15 @@ execute from the page's definition-level validity and do not decode values.
 On little-endian ARM NEON, PLAIN INT32 pages with logical signed 16-bit values decode through
 deinterleaving loads. Every discarded high half must match the low half's sign extension.
 
-The reader pushes sparse row selections through decoder `skip`/`get`, lazily attaches available
-offset indexes so whole pages can be skipped, and casts physical values directly into their logical
-Vortex dtype during decode. Without an offset index it probes chained page headers after the mask is
-known, constructs equivalent in-memory page locations, and fetches only pages containing selected
-rows rather than falling back to arrow-rs. Density policies can be configured either through
-`ReaderOptions` or environment
-variables:
+The decoder casts physical values directly into their logical Vortex dtype. Density policies can be
+configured either through `ReaderOptions` or environment variables:
 
-- `VORTEX_PARQUET_FILTER_EVAL_THRESHOLD` (default `0.2`) controls when later conjuncts evaluate only
-  the rows surviving the existing mask.
-- `VORTEX_PARQUET_SELECTIVE_DECODE_THRESHOLD` (default `0.1`) controls when projected columns use
-  Parquet record skipping instead of a reusable full decode.
 - `VORTEX_PARQUET_FILTER_KERNEL_THRESHOLD` (default `1.0`) controls when a page filter uses decoder
   skipping. Append an encoding name for an override, such as
   `VORTEX_PARQUET_FILTER_KERNEL_THRESHOLD_DELTA_BYTE_ARRAY`.
+- `VORTEX_PARQUET_FILTER_EVAL_THRESHOLD` and `VORTEX_PARQUET_SELECTIVE_DECODE_THRESHOLD` are still
+  accepted but have no effect on the V2 path: Vortex's filter planner orders conjunct evaluation,
+  and selective record decoding returns with spiraldb/vortex-parquet#6.
 
 Footer row counts and flat-column min, max, null count, and Arrow memory-size estimates are exposed
 through the Vortex `DataSource`, preserving exact/inexact precision for DataFusion planning.
@@ -111,9 +114,7 @@ trusted file bounds and a zero null count prove that every row matches. This avo
 used only by those filters. Dynamic comparisons, unknown statistics, and unsupported domains retain
 their filters.
 
-The data source schedules exactly one row task per Parquet row group. It never accepts Vortex's
-arbitrary 100k-row `SplitBy::Layout` subdivision, because an arbitrary boundary can make two tasks
-decompress the same Snappy page. Once a row-group filter mask resolves, projected field futures are
-spawned concurrently; output arrays may be sliced into smaller downstream batches without changing
-the physical decode unit. The default decode cache is ephemeral: it shares live/in-flight work but
-holds no completed decoded array after the last consumer releases it.
+The data source schedules exactly one partition per Parquet row group, each a V2 scan of that row
+group's rows. Vortex's executor runs it in chunks of at most 64K rows; the shared decode means a
+row group is still decompressed once. The default decode cache is ephemeral: it shares live work
+but holds no completed decoded array after the last plan releases it.

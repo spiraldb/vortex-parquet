@@ -34,10 +34,14 @@ use clap::ValueEnum;
 use futures::TryStreamExt;
 use vortex::VortexSessionDefault;
 use vortex::array::VortexSessionExecute;
+use vortex::array::stream::ArrayStreamAdapter;
 use vortex::arrow::ExecuteArrowExt;
 use vortex::io::session::RuntimeSessionExt;
-use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::layout::scan::v2::ScanBuilder;
+use vortex::layout::scan::v2::ScanFile;
+use vortex::scan::execution::driver::ScanDriver;
 use vortex::session::VortexSession;
+use vortex::utils::parallelism::get_available_parallelism;
 
 use crate::arm::ArmRef;
 use crate::arm::DataFusionParquet;
@@ -786,12 +790,10 @@ async fn recompress(path: &Path, codec: &str) -> Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8"))?;
-    let reader = vortex_parquet::open_path(path_str, &session).await?;
+    let file = vortex_parquet::open_path(path_str, &session).await?;
     // Row groups sized to match the source, so the only difference is the codec.
     let row_group_rows = 111_111usize;
-    let mut stream = ScanBuilder::new(session.clone(), reader)
-        .with_ordered(true)
-        .into_array_stream()?;
+    let mut stream = ordered_scan(&session, file);
 
     let started = Instant::now();
     let mut writer: Option<ArrowWriter<std::fs::File>> = None;
@@ -840,6 +842,16 @@ async fn recompress(path: &Path, codec: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every row of `file`, in order, through Vortex's V2 scan.
+fn ordered_scan(
+    session: &VortexSession,
+    file: ScanFile,
+) -> futures::stream::BoxStream<'static, vortex::error::VortexResult<vortex::array::ArrayRef>> {
+    let concurrency = get_available_parallelism().unwrap_or(1);
+    ScanDriver::new(session.handle(), concurrency, true)
+        .run(ScanBuilder::new(session.clone(), file))
+}
+
 /// Writes the Parquet file's rows out as a Vortex file beside it.
 ///
 /// Read through this crate's own reader rather than arrow-rs's, so the Vortex file holds exactly what
@@ -859,10 +871,9 @@ async fn convert(path: &Path) -> Result<()> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8"))?;
-    let reader = vortex_parquet::open_path(path_str, &session).await?;
-    let stream = ScanBuilder::new(session.clone(), reader)
-        .with_ordered(true)
-        .into_array_stream()?;
+    let file = vortex_parquet::open_path(path_str, &session).await?;
+    let dtype = file.layout.dtype().clone();
+    let stream = ArrayStreamAdapter::new(dtype, ordered_scan(&session, file));
 
     let file = tokio::fs::File::create(&partial).await?;
     let started = Instant::now();

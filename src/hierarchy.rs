@@ -30,11 +30,11 @@ use vortex::layout::VTable;
 use vortex::layout::layout_children;
 use vortex::layout::segments::SegmentId;
 use vortex::layout::segments::SegmentSource;
+use vortex::scan::plan::PlanRef;
 use vortex::session::VortexSession;
 use vortex::session::registry::CachedId;
 
-use crate::layout::PageExecutionData;
-use crate::reader::ParquetPageSetReader;
+use crate::layout::no_layout_reader;
 
 /// Parquet-file layout vtable.
 #[derive(Clone, Debug)]
@@ -108,8 +108,6 @@ pub struct PageSetData {
     pub column_index: Option<Range<u64>>,
     /// Bloom-filter range when the writer supplied one.
     pub bloom_filter: Option<Range<u64>>,
-    /// State required to turn this lazy page set into an executable reader.
-    pub execution: PageExecutionData,
 }
 
 impl VTable for ParquetFile {
@@ -151,15 +149,20 @@ impl VTable for ParquetFile {
 
     fn new_reader(
         layout: &Layout<Self>,
-        name: Arc<str>,
-        source: Arc<dyn SegmentSource>,
-        session: &VortexSession,
-        ctx: &LayoutReaderContext,
+        _name: Arc<str>,
+        _source: Arc<dyn SegmentSource>,
+        _session: &VortexSession,
+        _ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
+        no_layout_reader(layout.vtable().id())
+    }
+
+    /// Transparent: the plan is its child's.
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
         layout
             .slot(0)?
             .ok_or_else(|| vortex_err!("missing required layout child"))?
-            .new_reader(format!("{name}.row-groups").into(), source, session, ctx)
+            .new_plan()
     }
 }
 
@@ -202,15 +205,20 @@ impl VTable for ParquetRowGroup {
 
     fn new_reader(
         layout: &Layout<Self>,
-        name: Arc<str>,
-        source: Arc<dyn SegmentSource>,
-        session: &VortexSession,
-        ctx: &LayoutReaderContext,
+        _name: Arc<str>,
+        _source: Arc<dyn SegmentSource>,
+        _session: &VortexSession,
+        _ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
+        no_layout_reader(layout.vtable().id())
+    }
+
+    /// Transparent: the plan is its child's.
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
         layout
             .slot(0)?
             .ok_or_else(|| vortex_err!("missing required layout child"))?
-            .new_reader(format!("{name}.columns").into(), source, session, ctx)
+            .new_plan()
     }
 }
 
@@ -253,15 +261,12 @@ impl VTable for ParquetColumnChunk {
 
     fn new_reader(
         layout: &Layout<Self>,
-        name: Arc<str>,
-        source: Arc<dyn SegmentSource>,
-        session: &VortexSession,
+        _name: Arc<str>,
+        _source: Arc<dyn SegmentSource>,
+        _session: &VortexSession,
         _ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        layout
-            .slot(0)?
-            .ok_or_else(|| vortex_err!("missing required layout child"))?
-            .new_reader(name, source, session, _ctx)
+        no_layout_reader(layout.vtable().id())
     }
 }
 
@@ -298,20 +303,12 @@ macro_rules! page_set_vtable {
 
             fn new_reader(
                 layout: &Layout<Self>,
-                name: Arc<str>,
-                source: Arc<dyn SegmentSource>,
-                session: &VortexSession,
+                _name: Arc<str>,
+                _source: Arc<dyn SegmentSource>,
+                _session: &VortexSession,
                 _ctx: &LayoutReaderContext,
             ) -> VortexResult<LayoutReaderRef> {
-                Ok(Arc::new(ParquetPageSetReader::new(
-                    name,
-                    layout.dtype().clone(),
-                    layout.row_count(),
-                    layout.segment_ids()[0],
-                    layout.data().execution.clone(),
-                    source,
-                    session.clone(),
-                )?))
+                no_layout_reader(layout.vtable().id())
             }
         }
     };

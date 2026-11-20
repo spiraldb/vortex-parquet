@@ -9,26 +9,18 @@
 //! coalescing I/O driver Vortex uses for its own files.
 //!
 //! That is what [`SegmentTable`] does. Register the byte ranges the reader will want, keep the
-//! returned [`SegmentId`]s in the layout, and Vortex's driver handles request coalescing,
-//! concurrency limiting, and alignment for free.
+//! returned [`SegmentId`]s in the layout, and hand [`SegmentTable::locations`] to the V2 scan's
+//! [`ScanFile`](vortex::layout::scan::v2::ScanFile). The session's I/O scheduler then handles
+//! request coalescing, deduplication, retention and alignment for free.
 
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::OnceLock;
 
 use vortex::buffer::Alignment;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
-use vortex::file::SegmentSpec;
-use vortex::file::segments::FileSegmentSource;
-use vortex::file::segments::RequestMetrics;
-use vortex::io::VortexReadAt;
-use vortex::io::runtime::Handle;
-use vortex::layout::segments::SegmentFuture;
-use vortex::layout::segments::SegmentId;
-use vortex::layout::segments::SegmentSource;
-use vortex::metrics::MetricsRegistry;
+use vortex::io::segments::SegmentId;
+use vortex::io::segments::SegmentLocation;
 
 /// A builder for the byte ranges this reader intends to read from a Parquet file.
 ///
@@ -37,7 +29,7 @@ use vortex::metrics::MetricsRegistry;
 /// driver sorts and coalesces at request time.
 #[derive(Clone, Debug, Default)]
 pub struct SegmentTable {
-    specs: Vec<SegmentSpec>,
+    locations: Vec<SegmentLocation>,
 }
 
 impl SegmentTable {
@@ -49,7 +41,7 @@ impl SegmentTable {
     /// Creates an empty segment table with space for `capacity` segments.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            specs: Vec::with_capacity(capacity),
+            locations: Vec::with_capacity(capacity),
         }
     }
 
@@ -80,7 +72,7 @@ impl SegmentTable {
             );
         }
 
-        // `SegmentSpec` stores lengths as `u32`, which caps a single segment at 4GiB. That is not a
+        // `SegmentLocation` stores lengths as `u32`, which caps a single segment at 4GiB. That is not a
         // limit worth working around: a segment is the unit of a single coalesced read, and wanting
         // more than 4GiB in one read should mean splitting it into several segments so the driver
         // can pipeline them.
@@ -94,8 +86,8 @@ impl SegmentTable {
             )
         })?;
 
-        let id = SegmentId::try_from(self.specs.len())?;
-        self.specs.push(SegmentSpec {
+        let id = SegmentId::try_from(self.locations.len())?;
+        self.locations.push(SegmentLocation {
             offset: byte_range.start,
             length,
             alignment,
@@ -105,82 +97,33 @@ impl SegmentTable {
 
     /// Returns the number of registered segments.
     pub fn len(&self) -> usize {
-        self.specs.len()
+        self.locations.len()
     }
 
     /// Returns `true` if no segments have been registered.
     pub fn is_empty(&self) -> bool {
-        self.specs.is_empty()
+        self.locations.is_empty()
     }
 
     /// Returns the byte range registered for `id`, or `None` if `id` is not in this table.
     pub fn byte_range(&self, id: SegmentId) -> Option<Range<u64>> {
-        self.specs
+        self.locations
             .get(usize::try_from(*id).ok()?)
-            .map(SegmentSpec::byte_range)
+            .map(|location| location.offset..location.offset + u64::from(location.length))
     }
 
     /// Returns the total number of bytes spanned by the registered segments, counting overlaps
     /// once per segment.
     pub fn total_bytes(&self) -> u64 {
-        self.specs
+        self.locations
             .iter()
-            .map(|spec| u64::from(spec.length))
+            .map(|location| u64::from(location.length))
             .sum::<u64>()
     }
 
-    /// Returns the registered specs, in [`SegmentId`] order.
-    pub fn specs(&self) -> &[SegmentSpec] {
-        &self.specs
-    }
-
-    /// Builds a coalescing [`SegmentSource`] that serves this table's segments from `reader`.
-    ///
-    /// The returned source starts its background driver on the first segment request. Opening a
-    /// file only for its footer therefore needs no driver or later runtime polling to release it.
-    /// Requests for nearby segments are merged into single reads according to the reader's own
-    /// [`CoalesceConfig`](vortex::io::CoalesceConfig), so this crate gets object-store-appropriate
-    /// I/O behaviour without implementing any of it.
-    pub fn into_source<R: VortexReadAt + Clone>(
-        self,
-        reader: R,
-        handle: Handle,
-        metrics: &dyn MetricsRegistry,
-    ) -> Arc<dyn SegmentSource> {
-        let specs: Arc<[SegmentSpec]> = Arc::from(self.specs);
-        Arc::new(LazyFileSegmentSource {
-            specs,
-            reader,
-            handle,
-            metrics: RequestMetrics::new(metrics, vec![]),
-            source: OnceLock::new(),
-        })
-    }
-}
-
-/// Defer runtime task ownership until a scan actually needs column bytes. A current-thread
-/// runtime can finish footer-only futures without polling background tasks; eagerly spawned
-/// drivers would otherwise retain discarded planning-only files until a later data scan.
-struct LazyFileSegmentSource<R> {
-    specs: Arc<[SegmentSpec]>,
-    reader: R,
-    handle: Handle,
-    metrics: RequestMetrics,
-    source: OnceLock<FileSegmentSource>,
-}
-
-impl<R: VortexReadAt + Clone> SegmentSource for LazyFileSegmentSource<R> {
-    fn request(&self, id: SegmentId) -> SegmentFuture {
-        self.source
-            .get_or_init(|| {
-                FileSegmentSource::open(
-                    Arc::clone(&self.specs),
-                    self.reader.clone(),
-                    self.handle.clone(),
-                    self.metrics.clone(),
-                )
-            })
-            .request(id)
+    /// Returns the registered locations, in [`SegmentId`] order.
+    pub fn locations(&self) -> &[SegmentLocation] {
+        &self.locations
     }
 }
 

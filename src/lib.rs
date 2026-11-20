@@ -4,15 +4,17 @@
 //!
 //! # Why this can exist
 //!
-//! Vortex's reader is not welded to the Vortex file format. Its scan entry point,
-//! [`ScanBuilder::new`](vortex::layout::scan::scan_builder::ScanBuilder::new), takes a
-//! [`LayoutReader`](vortex::layout::LayoutReader) — not a file, not a footer, not a path.
-//! `VortexFile::scan()` is sugar over exactly that call. Everything the reader is good at — expression
-//! pushdown, split scheduling, mask refinement, coalesced I/O, projection, limits — is expressed
-//! against that one trait.
+//! Vortex's planner-driven scan is not welded to the Vortex file format. Its entry point,
+//! [`ScanBuilder::new`](vortex::layout::scan::v2::ScanBuilder::new), takes a
+//! [`ScanFile`](vortex::layout::scan::v2::ScanFile): a layout tree, a table of where each segment
+//! the layouts name lives, and a reader for those segments. `VortexFile::scan_file()` builds one
+//! from a Vortex footer. Everything the scan is good at — expression pushdown, zone pruning,
+//! filter ordering, coalesced and deduplicated I/O, projection, limits — is expressed against the
+//! physical plans those layouts lower to.
 //!
-//! So reading Parquet with the Vortex reader means neither converting the file nor forking the
-//! reader. It means implementing `LayoutReader` over the Parquet bytes.
+//! So reading Parquet with the Vortex scan means neither converting the file nor forking the
+//! scan. It means building a `ScanFile` from a Parquet footer, with layouts that lower to plans
+//! reading Parquet bytes.
 //!
 //! # How it works
 //!
@@ -29,9 +31,11 @@
 //!                  └─ ParquetIndexedPages or ParquetHeaderPages
 //! ```
 //!
-//! Nothing is rewritten and no Vortex footer is serialized. Generic `ChunkedLayout` and
-//! `StructLayout` nodes retain Vortex's split and expression machinery. Open reads only the footer;
-//! page indexes and chained page headers are discovered through distinct lazy page-set layouts.
+//! Nothing is rewritten and no Vortex footer is serialized. Open reads only the footer. Each
+//! `ParquetField` names one segment, the byte range of its column chunks, and lowers to the plans
+//! in [`plan`]: a leaf that reads and decodes that segment, under the row group's footer
+//! statistics as a zone map. The physical children below it describe the file for inspection;
+//! they do not lower to plans of their own.
 //!
 //! # Status
 //!
@@ -41,15 +45,23 @@
 //! Nested fields currently fall back to arrow-rs at the `ParquetField` boundary, where repetition
 //! and definition levels are reconstructed.
 //!
+//! The scan reads whole column chunks. Page-index pruning, Bloom-filter pruning and page-granular
+//! reads are not yet expressed as plans; see [`plan`] and spiraldb/vortex-parquet#6.
+//!
 //! # Usage
 //!
 //! ```ignore
 //! let session = VortexSession::default().with_handle(handle);
-//! let reader = open_path("data/events.parquet", &session).await?;
-//! let stream = ScanBuilder::new(session, reader)
-//!     .with_filter(gt(get_item("ts", root()), lit(cutoff)))
-//!     .into_array_stream()?;
+//! let file = open_path("data/events.parquet", &session).await?;
+//! let dtype = file.layout.dtype().clone();
+//! let scan = ScanBuilder::new(session.clone(), file)
+//!     .with_some_filter(Some(gt(get_item("ts", root()), lit(cutoff)).bind(&dtype)?));
+//! let batches = ScanDriver::new(session.handle(), concurrency, true).run(scan);
 //! ```
+//!
+//! Engines speaking the Vortex Scan API should open a [`DataSource`](vortex::scan::DataSource)
+//! instead, through [`ParquetFormat::open_data_source`]; it scans each row group as a partition
+//! through the same plans.
 
 #![deny(missing_docs)]
 
@@ -75,6 +87,7 @@ pub mod layout;
 pub mod metrics;
 pub mod options;
 pub mod pages;
+pub mod plan;
 mod reader;
 pub mod segments;
 mod statistics;
@@ -87,7 +100,6 @@ use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::metadata::FooterTail;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::metadata::ParquetMetaDataReader;
-use parquet::file::metadata::ParquetOffsetIndex;
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
@@ -97,11 +109,17 @@ use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 use vortex::io::filesystem::FileSystem;
-use vortex::layout::LayoutReaderRef;
+use vortex::io::request::PlacedSegments;
+use vortex::io::request::SegmentReader;
+use vortex::io::segments::RequestMetrics;
+use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutRef;
 use vortex::layout::layout_children;
 use vortex::layout::layouts::chunked::ChunkedLayout;
 use vortex::layout::layouts::struct_::StructLayout;
+use vortex::layout::scan::v2::ScanFile;
+use vortex::metrics::DefaultMetricsRegistry;
+use vortex::metrics::MetricsRegistry;
 use vortex::scan::DataSourceRef;
 use vortex::session::VortexSession;
 
@@ -123,12 +141,11 @@ use crate::layout::BloomFilterSegment;
 use crate::layout::ColumnIndexSegment;
 use crate::layout::FileContext;
 use crate::layout::OffsetIndexSegment;
-use crate::layout::PageExecutionData;
 use crate::layout::ParquetFieldData;
 use crate::layout::field_layout;
 use crate::metrics::ScanMetrics;
 use crate::options::ReaderOptions;
-use crate::reader::SharedArrayFuture;
+use crate::plan::DecodedChunk;
 use crate::segments::SegmentTable;
 
 /// The bytes at both ends of every Parquet file.
@@ -143,21 +160,9 @@ const FOOTER_TAIL_LEN: u64 = 8;
 /// only in-flight work and retains no completed arrays; retained cache policies are explicit.
 #[derive(Clone, Debug)]
 pub struct ParquetFormat {
-    decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
+    decode_cache: Arc<DecodeCache<DecodedChunk>>,
     metrics: Arc<ScanMetrics>,
     options: ReaderOptions,
-}
-
-/// An opened Parquet file and the precise layout that produced its reader.
-///
-/// Most callers only need [`ParquetFormat::open`]. This form exists for planners, diagnostics, and
-/// tests that need to inspect physical column chunks and pages before constructing a scan.
-#[derive(Clone)]
-pub struct OpenedParquetFile {
-    /// The root `vortex.parquet.file` layout.
-    pub layout: LayoutRef,
-    /// A reader over `layout` and the file's registered byte segments.
-    pub reader: LayoutReaderRef,
 }
 
 impl Default for ParquetFormat {
@@ -202,7 +207,7 @@ impl ParquetFormat {
     }
 
     /// The decode cache this reader holds, shared by every file it opens.
-    pub fn decode_cache(&self) -> &Arc<DecodeCache<SharedArrayFuture>> {
+    pub fn decode_cache(&self) -> &Arc<DecodeCache<DecodedChunk>> {
         &self.decode_cache
     }
 
@@ -214,34 +219,28 @@ impl ParquetFormat {
         self.decode_cache.clear();
     }
 
-    /// Opens `file`, returning a reader Vortex can scan.
-    pub async fn open(&self, file: FileHandle) -> VortexResult<LayoutReaderRef> {
-        Ok(open_inner(
+    /// Opens `file` for Vortex's planner-driven scan.
+    ///
+    /// Reads only the footer. The returned [`ScanFile`] carries the file's layout tree, where each
+    /// of its column chunks lives, and a reader over the file's bytes through the session's I/O
+    /// scheduler. Pass it to [`ScanBuilder::new`](vortex::layout::scan::v2::ScanBuilder::new).
+    pub async fn open(&self, file: FileHandle) -> VortexResult<ScanFile> {
+        let metadata = read_footer(&file).await?;
+        let prepared = PreparedFile::new(
             file,
+            metadata,
             Arc::clone(&self.decode_cache),
             Arc::clone(&self.metrics),
             self.options,
-        )
-        .await?
-        .reader)
-    }
-
-    /// Opens `file` while retaining its inspectable physical layout tree.
-    pub async fn open_file(&self, file: FileHandle) -> VortexResult<OpenedParquetFile> {
-        open_inner(
-            file,
-            Arc::clone(&self.decode_cache),
-            Arc::clone(&self.metrics),
-            self.options,
-        )
-        .await
+        )?;
+        scan_file(&prepared)
     }
 
     /// Opens `file` as a Vortex [`DataSource`](vortex::scan::DataSource).
     ///
     /// This is the bridge that makes the reader usable by anything speaking the Vortex Scan API,
-    /// including `vortex-datafusion`. Footer-derived statistics are available at bind; layout
-    /// readers are built when a scan supplies its projection and filter.
+    /// including `vortex-datafusion`. Footer-derived statistics are available at bind; the layout
+    /// tree is built on the first scan and shared by every scan after it.
     pub async fn open_data_source(&self, file: FileHandle) -> VortexResult<DataSourceRef> {
         let metadata = read_footer(&file).await?;
         self.open_data_source_with_metadata(file, metadata)
@@ -250,8 +249,8 @@ impl ParquetFormat {
     /// Opens a fresh data source using a previously parsed footer.
     ///
     /// The caller must ensure `metadata` belongs to the same file version as `file`. This avoids
-    /// footer I/O and parsing while creating fresh per-file state. Layouts and readers are built
-    /// when a scan supplies its referenced columns.
+    /// footer I/O and parsing while creating fresh per-file state. The layout tree is built on the
+    /// first scan.
     pub fn open_data_source_with_metadata(
         &self,
         file: FileHandle,
@@ -287,27 +286,27 @@ impl ParquetFormat {
         path: &str,
         fs: &dyn FileSystem,
         session: &VortexSession,
-    ) -> VortexResult<LayoutReaderRef> {
+    ) -> VortexResult<ScanFile> {
         self.open(file_handle(path, fs, session).await?).await
     }
 }
 
-/// Opens a Parquet file on the local filesystem, returning a reader Vortex can scan.
+/// Opens a Parquet file on the local filesystem for Vortex's planner-driven scan.
 ///
 /// A convenience for tests, benchmarks, and CLIs: it builds a local filesystem and a fresh decode
 /// state per call. Anything running more than one query should hold a [`ParquetFormat`] so in-flight
 /// work and metrics are shared.
-pub async fn open_path(path: &str, session: &VortexSession) -> VortexResult<LayoutReaderRef> {
+pub async fn open_path(path: &str, session: &VortexSession) -> VortexResult<ScanFile> {
     let fs = local_filesystem(session);
     ParquetFormat::new()
         .open_path(path, fs.as_ref(), session)
         .await
 }
 
-/// Opens a Parquet file, returning a reader Vortex can scan.
+/// Opens a Parquet file for Vortex's planner-driven scan.
 ///
 /// Uses fresh decode-sharing state; go through [`ParquetFormat`] to share one across files.
-pub async fn open(file: FileHandle) -> VortexResult<LayoutReaderRef> {
+pub async fn open(file: FileHandle) -> VortexResult<ScanFile> {
     ParquetFormat::new().open(file).await
 }
 
@@ -319,28 +318,6 @@ pub async fn open(file: FileHandle) -> VortexResult<LayoutReaderRef> {
 /// being measured is the engines' parallelism rather than their readers.
 pub async fn file_metadata(file: &FileHandle) -> VortexResult<Arc<ParquetMetaData>> {
     read_footer(file).await
-}
-
-/// Builds the layout tree over a Parquet file's bytes.
-async fn open_inner(
-    file: FileHandle,
-    decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
-    metrics: Arc<ScanMetrics>,
-    options: ReaderOptions,
-) -> VortexResult<OpenedParquetFile> {
-    let metadata = read_footer(&file).await?;
-    open_inner_with_metadata(file, metadata, decode_cache, metrics, options)
-}
-
-fn open_inner_with_metadata(
-    file: FileHandle,
-    metadata: Arc<ParquetMetaData>,
-    decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
-    metrics: Arc<ScanMetrics>,
-    options: ReaderOptions,
-) -> VortexResult<OpenedParquetFile> {
-    let prepared = PreparedFile::new(file, metadata, decode_cache, metrics, options)?;
-    open_prepared(&prepared, None)
 }
 
 /// A validated footer and converted schema, reusable across binds of the same file version.
@@ -464,7 +441,7 @@ impl PreparedFile {
     fn new(
         file: FileHandle,
         metadata: Arc<ParquetMetaData>,
-        decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
+        decode_cache: Arc<DecodeCache<DecodedChunk>>,
         metrics: Arc<ScanMetrics>,
         options: ReaderOptions,
     ) -> VortexResult<Self> {
@@ -475,7 +452,7 @@ impl PreparedFile {
     fn from_metadata(
         file: FileHandle,
         metadata: &PreparedParquetMetadata,
-        decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
+        decode_cache: Arc<DecodeCache<DecodedChunk>>,
         metrics: Arc<ScanMetrics>,
         options: ReaderOptions,
     ) -> VortexResult<Self> {
@@ -501,42 +478,48 @@ impl PreparedFile {
     }
 }
 
-fn open_prepared(
-    prepared: &PreparedFile,
-    selected: Option<&[bool]>,
-) -> VortexResult<OpenedParquetFile> {
+/// The parts of `prepared`'s file that Vortex's planner-driven scan reads through.
+///
+/// Builds the whole layout tree and its segment table, and one placed segment reader over the
+/// file's bytes so the session's I/O scheduler coalesces, deduplicates and retains reads by byte
+/// offset. Segment ids index the table, so a file must keep one `ScanFile` for every scan that
+/// shares its reader.
+pub(crate) fn scan_file(prepared: &PreparedFile) -> VortexResult<ScanFile> {
+    let (layout, segments) = build_layout(prepared)?;
+    let handle = &prepared.ctx.file;
+    let default_metrics = DefaultMetricsRegistry::default();
+    let metrics: &dyn MetricsRegistry = handle
+        .metrics_registry()
+        .map_or(&default_metrics as &dyn MetricsRegistry, |metrics| {
+            metrics.as_ref()
+        });
+    let placed = PlacedSegments::new(
+        Arc::clone(handle.read()),
+        handle.session().handle(),
+        RequestMetrics::new(metrics, vec![]),
+    );
+    Ok(ScanFile {
+        layout,
+        locations: Arc::from(segments.locations()),
+        reader: SegmentReader::Placed(Arc::new(placed)),
+        cache: None,
+    })
+}
+
+/// Builds the layout tree over `prepared`'s footer and the table of byte ranges its leaves name.
+///
+/// The segment ids in the layout index the returned table, so the two are only meaningful
+/// together.
+fn build_layout(prepared: &PreparedFile) -> VortexResult<(LayoutRef, SegmentTable)> {
     let ctx = &prepared.ctx;
     let file = &ctx.file;
     let metadata = &ctx.metadata;
     pages::register_kernels(file.session());
-    let DType::Struct(fields, nullability) = &prepared.dtype else {
+    let DType::Struct(fields, _) = &prepared.dtype else {
         vortex_bail!("Parquet root must be a struct");
     };
-    if let Some(selected) = selected {
-        vortex_ensure!(
-            selected.len() == fields.nfields(),
-            "invalid column selection length"
-        );
-    }
-    let dtype = if let Some(selected) = selected {
-        DType::Struct(
-            vortex::dtype::StructFields::from_iter(
-                fields
-                    .names()
-                    .iter()
-                    .cloned()
-                    .zip(fields.fields())
-                    .enumerate()
-                    .filter_map(|(index, field)| selected[index].then_some(field)),
-            ),
-            *nullability,
-        )
-    } else {
-        prepared.dtype.clone()
-    };
-    let selected_count = dtype
-        .as_struct_fields_opt()
-        .map_or(0, |fields| fields.nfields());
+    let dtype = prepared.dtype.clone();
+    let selected_count = fields.nfields();
     let schema = metadata.file_metadata().schema_descr();
 
     // Footer-known physical objects and lazy discovery inputs are represented explicitly. Page
@@ -557,9 +540,6 @@ fn open_prepared(
 
         let mut column_layouts: Vec<LayoutRef> = Vec::with_capacity(selected_count);
         for (root_column, leaves) in prepared.root_leaves.iter().enumerate() {
-            if selected.is_some_and(|selected| !selected[root_column]) {
-                continue;
-            }
             let field_dtype = fields.field_by_index(root_column).ok_or_else(|| {
                 vortex_err!("no top-level column {root_column} in the Parquet schema")
             })?;
@@ -648,28 +628,6 @@ fn open_prepared(
                     offset_index: offset_index.clone(),
                     column_index: column_index.clone(),
                     bloom_filter: bloom_filter.clone(),
-                    execution: PageExecutionData {
-                        ctx: Arc::clone(ctx),
-                        row_group: rg_idx,
-                        root_column,
-                        byte_offset: chunk_offset,
-                        byte_length: chunk_length,
-                        offset_indexes: offset_indexes
-                            .iter()
-                            .filter(|index| index.leaf == leaf)
-                            .cloned()
-                            .collect(),
-                        column_indexes: column_indexes
-                            .iter()
-                            .filter(|index| index.leaf == leaf)
-                            .cloned()
-                            .collect(),
-                        bloom_filters: bloom_filters
-                            .iter()
-                            .filter(|filter| filter.leaf == leaf)
-                            .cloned()
-                            .collect(),
-                    },
                 };
                 let pages = if offset_index.is_some() {
                     Arc::new(indexed_pages_layout(
@@ -736,8 +694,6 @@ fn open_prepared(
         })?;
     }
 
-    let source = file.segment_source(segments)?;
-
     // A chunked layout even for a single row group, so the reader's shape does not depend on the
     // file's chunking. A one-child chunked layout costs a pointer hop and removes a special case.
     let row_groups = Arc::new(ChunkedLayout::new(
@@ -746,16 +702,7 @@ fn open_prepared(
         layout_children(row_group_layouts),
     )) as LayoutRef;
     let root = Arc::new(file_layout(dtype, total_rows, row_groups)) as LayoutRef;
-    let reader = root.new_reader(
-        "parquet".into(),
-        source,
-        file.session(),
-        &Default::default(),
-    )?;
-    Ok(OpenedParquetFile {
-        layout: root,
-        reader,
-    })
+    Ok((root, segments))
 }
 
 /// The dtype on the Parquet wire, before logical annotations and Dremel reconstruction.
@@ -883,95 +830,6 @@ async fn read_footer(file: &FileHandle) -> VortexResult<Arc<ParquetMetaData>> {
         ParquetMetaDataReader::decode_metadata(footer_bytes.as_ref())
             .map_err(|e| vortex_err!("failed to decode the Parquet footer: {e}"))?,
     ))
-}
-
-/// Whether every offset index describes pages that could exist in `metadata`.
-///
-/// The indexes are borrowed separately so validating lazily loaded indexes does not require
-/// cloning the file's footer just to attach them.
-///
-/// An offset index is *data*: it decides which bytes are read and which rows they are believed to
-/// hold, and a malformed one does not fail loudly — it yields the expected number of rows over the
-/// wrong values. Anything inconsistent with the column chunk it describes disqualifies the whole
-/// index, because a reader that trusts it for one column and not another is harder to reason about
-/// than one that does not trust it at all.
-pub(crate) fn offset_index_is_sound(
-    metadata: &ParquetMetaData,
-    offset_index: &ParquetOffsetIndex,
-) -> bool {
-    if offset_index.len() != metadata.num_row_groups() {
-        return false;
-    }
-
-    for (rg_idx, columns) in offset_index.iter().enumerate() {
-        let rg = metadata.row_group(rg_idx);
-        if columns.len() != rg.num_columns() {
-            return false;
-        }
-        let Ok(rows) = u64::try_from(rg.num_rows()) else {
-            return false;
-        };
-
-        for (leaf, index) in columns.iter().enumerate() {
-            let locations = &index.page_locations;
-            if locations.is_empty() {
-                // A column with no page locations is not malformed; it simply cannot be page-addressed.
-                continue;
-            }
-            let column = rg.column(leaf);
-            // `byte_range` panics on negative offsets; this validator's whole job is to survive a
-            // hostile footer, so it must not be the thing that crashes on one.
-            let Ok((chunk_start, chunk_len)) = checked_byte_range(column, rg_idx, leaf) else {
-                return false;
-            };
-            let chunk_end = chunk_start.saturating_add(chunk_len);
-
-            let mut previous: Option<(u64, u64)> = None;
-            for location in locations {
-                let (Ok(offset), Ok(first_row)) = (
-                    u64::try_from(location.offset),
-                    u64::try_from(location.first_row_index),
-                ) else {
-                    return false;
-                };
-                if location.compressed_page_size <= 0 {
-                    return false;
-                }
-                let Ok(page_len) = u64::try_from(location.compressed_page_size) else {
-                    return false;
-                };
-                let Some(page_end) = offset.checked_add(page_len) else {
-                    return false;
-                };
-                // Inside the chunk it claims to belong to, and leaving room for at least one byte.
-                if offset < chunk_start
-                    || offset >= chunk_end
-                    || page_end > chunk_end
-                    || first_row >= rows
-                {
-                    return false;
-                }
-                // Strictly increasing offsets and rows, AND no overlap: `previous` carries the last
-                // page's END, not its start. Comparing starts alone accepts a page that begins after
-                // its predecessor and still runs into it, which makes the row-to-page mapping
-                // ambiguous — two pages claiming the same bytes, so a row lookup has two answers.
-                if let Some((last_end, last_row)) = previous
-                    && (offset < last_end || first_row <= last_row)
-                {
-                    return false;
-                }
-                previous = Some((page_end, first_row));
-            }
-
-            // The first data page must start the row group. A nonzero first row means the index does
-            // not describe this chunk from its beginning, and every row-to-page mapping derived from
-            // it would be shifted.
-            if u64::try_from(locations[0].first_row_index).is_ok_and(|first| first != 0) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// The byte range spanned by every column chunk belonging to one top-level column.
@@ -1274,7 +1132,7 @@ mod tests {
 
     /// A column chunk over 4 GiB cannot be one segment, and must say so actionably.
     ///
-    /// `SegmentSpec` stores a length as `u32`. This is reachable on a genuinely large row group rather
+    /// `SegmentLocation` stores a length as `u32`. This is reachable on a genuinely large row group rather
     /// than only on corrupt metadata, so the boundary is asserted rather than assumed — and the message
     /// has to say what to do, because the answer is to split the range, not to give up.
     #[test]
@@ -1290,125 +1148,5 @@ mod tests {
         );
         // One byte under the limit is fine, so the boundary is where it claims to be.
         assert!(segments.push(0..(over - 1)).is_ok());
-    }
-
-    /// A footer whose single chunk spans bytes 100..200 of a 10-row row group, described by `pages`.
-    ///
-    /// The chunk is fixed so the cases below vary only the index, which is the thing under test.
-    fn metadata_with_pages(pages: Vec<(i64, i32, i64)>) -> ParquetMetaData {
-        use parquet::file::page_index::offset_index::OffsetIndexMetaData;
-        use parquet::file::page_index::offset_index::PageLocation;
-
-        let metadata = metadata_with(
-            |b| b.set_data_page_offset(100).set_total_compressed_size(100),
-            10,
-        );
-        let index = OffsetIndexMetaData {
-            page_locations: pages
-                .into_iter()
-                .map(
-                    |(offset, compressed_page_size, first_row_index)| PageLocation {
-                        offset,
-                        compressed_page_size,
-                        first_row_index,
-                    },
-                )
-                .collect(),
-            unencoded_byte_array_data_bytes: None,
-        };
-        metadata
-            .into_builder()
-            .set_offset_index(Some(vec![vec![index]]))
-            .build()
-    }
-
-    /// The index a real writer emits must be accepted, or every check below is passing vacuously.
-    #[test]
-    fn a_well_formed_offset_index_is_accepted() {
-        let metadata = metadata_with_pages(vec![(100, 40, 0), (140, 30, 4), (170, 30, 7)]);
-        assert!(offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
-    }
-
-    /// A page running off the end of its chunk must be refused.
-    ///
-    /// The check this pins was missing: only a page's *start* was tested against the chunk, so a
-    /// page could declare a length carrying it past the chunk end and into the next column's bytes.
-    /// The last page here starts legally at 170 and claims 60 bytes, ending at 230 against a chunk
-    /// ending at 200.
-    #[test]
-    fn a_page_extending_past_its_chunk_is_rejected() {
-        let metadata = metadata_with_pages(vec![(100, 40, 0), (140, 30, 4), (170, 60, 7)]);
-        assert!(!offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
-    }
-
-    /// A zero-length page is not a page, and admitting one would let extents stop advancing.
-    #[test]
-    fn a_zero_length_page_is_rejected() {
-        for page_size in [0, -8] {
-            let metadata = metadata_with_pages(vec![(100, page_size, 0)]);
-            assert!(!offset_index_is_sound(
-                &metadata,
-                metadata.offset_index().unwrap()
-            ));
-        }
-    }
-
-    /// A page starting before its chunk must be refused.
-    #[test]
-    fn a_page_before_its_chunk_is_rejected() {
-        let metadata = metadata_with_pages(vec![(80, 40, 0)]);
-        assert!(!offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
-    }
-
-    /// The documented limit of this validator, asserted so it is not mistaken for a proof.
-    ///
-    /// Every offset and row index here is shifted off the real page framing by a constant, which is
-    /// exactly the fault the check cannot see: the result is ordered, in bounds, non-overlapping and
-    /// starts at row zero, so it passes — and it still points at bytes that are not page headers.
-    /// Catching this needs the page headers parsed, which means reading the data region, which this
-    /// deliberately does not do. See `offset_index_is_sound`.
-    #[test]
-    fn a_consistently_wrong_index_passes_and_that_is_the_known_limit() {
-        let metadata = metadata_with_pages(vec![(100, 33, 0), (133, 33, 4), (166, 33, 7)]);
-        assert!(offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
-    }
-
-    /// Pages that overlap must be refused.
-    ///
-    /// The check this pins was missing: offsets were compared start-to-start, so a page could begin
-    /// after its predecessor's start and still run into its bytes. Page one spans 100..160 and page two
-    /// starts at 140, inside it -- two pages claiming the same bytes, so a row lookup has two answers
-    /// and neither is provably right.
-    #[test]
-    fn overlapping_pages_are_rejected() {
-        let metadata = metadata_with_pages(vec![(100, 60, 0), (140, 30, 4)]);
-        assert!(!offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
-    }
-
-    /// Pages that merely abut are fine: one page's end is the next page's start.
-    ///
-    /// The boundary case for the check above, and the reason it compares `<` rather than `<=`.
-    #[test]
-    fn abutting_pages_are_accepted() {
-        let metadata = metadata_with_pages(vec![(100, 40, 0), (140, 30, 4), (170, 30, 7)]);
-        assert!(offset_index_is_sound(
-            &metadata,
-            metadata.offset_index().unwrap()
-        ));
     }
 }

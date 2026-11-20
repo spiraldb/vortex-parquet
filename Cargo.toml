@@ -20,8 +20,8 @@ resolver = "2"
 # Arrow 58 remains at the Parquet decoder boundary; Arrow 59 matches Vortex and DataFusion 55.
 # src/arrow_bridge.rs transfers the nested fallback through the stable Arrow C Data Interface.
 [workspace.dependencies]
-vortex-datafusion = { git = "https://github.com/vortex-data/vortex.git", rev = "c58d6237e5ae89a8fcbe6b4c1827bad4360519a7", default-features = false }
-vortex = { git = "https://github.com/vortex-data/vortex.git", rev = "c58d6237e5ae89a8fcbe6b4c1827bad4360519a7", default-features = false }
+vortex-datafusion = { git = "https://github.com/vortex-data/vortex.git", rev = "a11813abbc2b16ce1bf01395f5eeb460555e9e06", default-features = false }
+vortex = { git = "https://github.com/vortex-data/vortex.git", rev = "a11813abbc2b16ce1bf01395f5eeb460555e9e06", default-features = false }
 
 [dependencies]
 # Vortex uses Arrow 59; the Parquet 58 experimental page API remains pinned.

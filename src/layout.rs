@@ -47,6 +47,7 @@ use vortex::layout::VTable;
 use vortex::layout::layout_children;
 use vortex::layout::segments::SegmentId;
 use vortex::layout::segments::SegmentSource;
+use vortex::scan::plan::PlanRef;
 use vortex::session::VortexSession;
 use vortex::session::registry::CachedId;
 
@@ -55,8 +56,7 @@ use crate::cache::FileId;
 use crate::file::FileHandle;
 use crate::metrics::ScanMetrics;
 use crate::options::ReaderOptions;
-use crate::reader::ParquetFieldReader;
-use crate::reader::SharedArrayFuture;
+use crate::plan::DecodedChunk;
 
 /// State shared by every leaf of one Parquet file.
 ///
@@ -71,7 +71,7 @@ pub struct FileContext {
     ///
     /// On the context rather than on each leaf because a budget is only meaningful in aggregate — see
     /// [`crate::cache`].
-    pub decode_cache: Arc<DecodeCache<SharedArrayFuture>>,
+    pub decode_cache: Arc<DecodeCache<DecodedChunk>>,
     /// Which file this is, so cached chunks of different files cannot collide.
     pub file_id: FileId,
     /// The parsed Parquet footer.
@@ -213,50 +213,13 @@ pub struct ChunkDecode {
     pub bloom_filters: Vec<BloomFilterSegment>,
 }
 
-/// Footer-known execution context attached to a lazy physical page-set layout.
+/// The error every Parquet layout returns for a [`LayoutReader`](vortex::layout::LayoutReader).
 ///
-/// This intentionally mirrors [`ParquetFieldData`] without the child dtype list: a page set needs
-/// enough information to become an actual reader after open, while the future it creates still
-/// captures only [`ChunkDecode`] and therefore cannot form a cache cycle.
-#[derive(Clone, Debug)]
-pub struct PageExecutionData {
-    /// Shared per-file state.
-    pub ctx: Arc<FileContext>,
-    /// Row-group ordinal.
-    pub row_group: usize,
-    /// Top-level field ordinal.
-    pub root_column: usize,
-    /// Exact column-chunk byte offset.
-    pub byte_offset: u64,
-    /// Exact column-chunk byte length.
-    pub byte_length: u64,
-    /// Offset-index segment for this physical leaf, if supplied.
-    pub offset_indexes: Vec<OffsetIndexSegment>,
-    /// Column-index segment for this physical leaf, if supplied.
-    pub column_indexes: Vec<ColumnIndexSegment>,
-    /// Bloom-filter segment for this physical leaf, if supplied.
-    pub bloom_filters: Vec<BloomFilterSegment>,
-}
-
-impl PageExecutionData {
-    /// Detaches the inputs captured by a decode future from the file's cache owner.
-    pub fn decode_inputs(&self) -> ChunkDecode {
-        ChunkDecode {
-            file: self.ctx.file.clone(),
-            metadata: Arc::clone(&self.ctx.metadata),
-            arrow_metadata: self.ctx.arrow_metadata.clone(),
-            file_len: self.ctx.file_len,
-            metrics: Arc::clone(&self.ctx.metrics),
-            options: self.ctx.options,
-            row_group: self.row_group,
-            root_column: self.root_column,
-            byte_offset: self.byte_offset,
-            byte_length: self.byte_length,
-            offset_indexes: self.offset_indexes.clone(),
-            column_indexes: self.column_indexes.clone(),
-            bloom_filters: self.bloom_filters.clone(),
-        }
-    }
+/// Parquet files scan through Vortex's planner-driven executor only: each layout lowers to a
+/// [`PlanRef`] (see [`crate::plan`]). Open a file with [`crate::ParquetFormat::open`] and pass the
+/// returned [`ScanFile`](vortex::layout::scan::v2::ScanFile) to a V2 scan.
+pub(crate) fn no_layout_reader<T>(id: LayoutId) -> VortexResult<T> {
+    vortex_bail!("layout '{id}' has no LayoutReader; scan Parquet files through the V2 scan plan")
 }
 
 /// The logical-field layout vtable.
@@ -309,31 +272,16 @@ impl VTable for ParquetField {
 
     fn new_reader(
         layout: &Layout<Self>,
-        name: Arc<str>,
-        segment_source: Arc<dyn SegmentSource>,
-        session: &VortexSession,
-        ctx: &LayoutReaderContext,
+        _name: Arc<str>,
+        _segment_source: Arc<dyn SegmentSource>,
+        _session: &VortexSession,
+        _ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        let physical = (layout.nchildren() == 1)
-            .then(|| {
-                layout
-                    .slot(0)?
-                    .ok_or_else(|| vortex_err!("missing required layout child"))?
-                    .new_reader(
-                        format!("{name}.column-chunk").into(),
-                        Arc::clone(&segment_source),
-                        session,
-                        ctx,
-                    )
-            })
-            .transpose()?;
-        Ok(Arc::new(ParquetFieldReader::new(
-            layout.clone(),
-            name,
-            segment_source,
-            session.clone(),
-            physical,
-        )?))
+        no_layout_reader(layout.vtable().id())
+    }
+
+    fn new_plan(layout: &Layout<Self>) -> VortexResult<PlanRef> {
+        crate::plan::field_plan(layout)
     }
 }
 
