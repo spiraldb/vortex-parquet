@@ -23,27 +23,28 @@ use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::ConstantArray;
 use vortex::array::builtins::ArrayBuiltins;
-use vortex::array::scalar_fn::internal::row_count::contains_row_count;
-use vortex::array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::dtype::extension::Matcher;
 use vortex::error::VortexResult;
+use vortex::expr::ArrayExprExt;
 use vortex::expr::BoundExpression;
 use vortex::expr::bound::lit;
+use vortex::expr::lambda::row_count::contains_row_count;
+use vortex::expr::lambda::row_count::substitute_row_count;
 use vortex::expr::stats::bind::StatBinder;
 use vortex::expr::stats::bind::bind_stats;
 use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
 use vortex::extension::datetime::AnyTemporal;
+use vortex::functions::between::Between;
 use vortex::mask::Mask;
 use vortex::scalar::DecimalValue;
 use vortex::scalar::Scalar;
-use vortex::scalar_fn::fns::between::Between;
-use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::literal::Literal;
-use vortex::scalar_fn::fns::operators::CompareOperator;
+use vortex::scalar_fn::builtin::compare::Compare;
+use vortex::scalar_fn::builtin::literal::Literal;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 use vortex::session::VortexSession;
 
 /// Footer or page statistics over one flat physical Parquet column.
@@ -147,7 +148,7 @@ fn direct_comparison_prunes(expr: &BoundExpression, stats: &ParquetStats<'_>) ->
     {
         return None;
     }
-    let operator = expr.as_opt::<Binary>()?.to_compare_operator()?;
+    let operator = *expr.as_opt::<Compare>()?;
     let (operator, value) = if expr.child(0).is_root() {
         (operator, expr.child(1).as_opt::<Literal>()?)
     } else if expr.child(1).is_root() {
@@ -291,6 +292,9 @@ fn stat_scalar(statistics: &Statistics, dtype: &DType, bound: Bound) -> Option<S
             .primitive_reinterpret_cast(PType::U64)
             .and_then(|value| value.cast(dtype))
             .ok(),
+        DType::Extension(ext) => {
+            Scalar::try_extension_ref(ext.clone(), physical.cast(ext.storage_dtype()).ok()?).ok()
+        }
         _ => physical.cast(dtype).ok(),
     }
 }
@@ -444,8 +448,8 @@ mod tests {
     use vortex::extension::datetime::Time;
     use vortex::extension::datetime::TimeUnit;
     use vortex::extension::datetime::Timestamp;
-    use vortex::scalar_fn::fns::between::BetweenOptions;
-    use vortex::scalar_fn::fns::between::StrictComparison;
+    use vortex::functions::between::BetweenOptions;
+    use vortex::functions::between::StrictComparison;
 
     use super::*;
 
@@ -582,7 +586,16 @@ mod tests {
             ),
         ];
         for (dtype, physical, offset) in dtypes {
-            let literal = |value: i64| lit(Scalar::from(value + offset).cast(&dtype).unwrap());
+            let literal = |value: i64| {
+                let value = Scalar::from(value + offset);
+                lit(match &dtype {
+                    DType::Extension(ext) => {
+                        let storage = value.cast(ext.storage_dtype()).unwrap();
+                        Scalar::try_extension_ref(ext.clone(), storage).unwrap()
+                    }
+                    _ => value.cast(&dtype).unwrap(),
+                })
+            };
             let stats = |minimum: i64, maximum: i64, null_count| match physical {
                 PType::I32 => Statistics::int32(
                     Some(i32::try_from(minimum + offset).unwrap()),

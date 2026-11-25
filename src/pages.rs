@@ -104,6 +104,7 @@ use vortex::array::arrays::ScalarFn;
 use vortex::array::arrays::ScalarFnArray;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::chunked::ChunkedArrayExt;
+use vortex::array::arrays::decimal::copy_to_canonical_width;
 use vortex::array::arrays::filter::FilterExecuteAdaptor;
 use vortex::array::arrays::filter::FilterKernel;
 use vortex::array::arrays::primitive::PrimitiveArrayExt;
@@ -129,6 +130,7 @@ use vortex::buffer::Buffer;
 use vortex::buffer::BufferMut;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
+use vortex::dtype::DecimalDType;
 use vortex::dtype::NativeDecimalType;
 use vortex::dtype::NativePType;
 use vortex::dtype::PType;
@@ -140,23 +142,23 @@ use vortex::error::vortex_panic;
 use vortex::extension::datetime::AnyTemporal;
 use vortex::extension::datetime::TemporalMetadata;
 use vortex::extension::datetime::TimeUnit;
+use vortex::functions::byte_length::ByteLength;
+use vortex::functions::byte_length::ByteLengthExecuteAdaptor;
+use vortex::functions::byte_length::ByteLengthKernel;
+use vortex::functions::like::Like;
+use vortex::functions::like::LikeExecuteAdaptor;
+use vortex::functions::like::LikeKernel;
+use vortex::functions::like::LikeOptions;
 use vortex::mask::Mask;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTable;
-use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::binary::CompareExecuteAdaptor;
-use vortex::scalar_fn::fns::binary::CompareKernel;
-use vortex::scalar_fn::fns::byte_length::ByteLength;
-use vortex::scalar_fn::fns::byte_length::ByteLengthExecuteAdaptor;
-use vortex::scalar_fn::fns::byte_length::ByteLengthKernel;
-use vortex::scalar_fn::fns::cast::Cast;
-use vortex::scalar_fn::fns::cast::CastExecuteAdaptor;
-use vortex::scalar_fn::fns::cast::CastKernel;
-use vortex::scalar_fn::fns::like::Like;
-use vortex::scalar_fn::fns::like::LikeExecuteAdaptor;
-use vortex::scalar_fn::fns::like::LikeKernel;
-use vortex::scalar_fn::fns::like::LikeOptions;
-use vortex::scalar_fn::fns::operators::CompareOperator;
+use vortex::scalar_fn::builtin::cast::Cast;
+use vortex::scalar_fn::builtin::cast::CastExecuteAdaptor;
+use vortex::scalar_fn::builtin::cast::CastKernel;
+use vortex::scalar_fn::builtin::compare::Compare;
+use vortex::scalar_fn::builtin::compare::CompareExecuteAdaptor;
+use vortex::scalar_fn::builtin::compare::CompareKernel;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 use vortex::session::SessionExt;
 use vortex::session::SessionVar;
 use vortex::session::VortexSession;
@@ -685,7 +687,7 @@ macro_rules! parquet_page_encoding {
             fn filter(
                 array: ArrayView<'_, Self>,
                 mask: &Mask,
-                _ctx: &mut ExecutionCtx,
+                ctx: &mut ExecutionCtx,
             ) -> VortexResult<Option<ArrayRef>> {
                 let threshold = array
                     .data()
@@ -712,7 +714,12 @@ macro_rules! parquet_page_encoding {
                     return Ok(None);
                 }
                 array.data().metrics.record_decoder_filter();
-                Ok(Some(filter_page_parts(array.data(), array.dtype(), mask)?))
+                Ok(Some(filter_page_parts(
+                    array.data(),
+                    array.dtype(),
+                    mask,
+                    ctx,
+                )?))
             }
         }
 
@@ -1235,12 +1242,13 @@ pub(crate) fn filter_page_chunks(array: ArrayRef, mask: Mask) -> VortexResult<Ar
 pub(crate) fn decode_selected_records(
     chunk_reader: SegmentChunkReader,
     column_metadata: &ColumnChunkMetaData,
-    descriptor: &ColumnDescPtr,
     dtype: &DType,
     row_count: u64,
     row_range: &std::ops::Range<usize>,
     mask: &Mask,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
+    let descriptor = column_metadata.column_descr_ptr();
     if descriptor.max_rep_level() != 0
         || descriptor.max_def_level() > 1
         || !direct_dtype(dtype, descriptor.physical_type())
@@ -1261,8 +1269,8 @@ pub(crate) fn decode_selected_records(
     macro_rules! selected {
         ($parquet_type:ty) => {{
             read_selected_records::<$parquet_type>(
-                ColumnReaderImpl::new(Arc::clone(descriptor), Box::new(reader)),
-                descriptor,
+                ColumnReaderImpl::new(Arc::clone(&descriptor), Box::new(reader)),
+                &descriptor,
                 row_range,
                 mask,
             )?
@@ -1284,7 +1292,7 @@ pub(crate) fn decode_selected_records(
         }
         PhysicalType::INT32 if dtype.is_decimal() => {
             let (values, validity) = selected!(Int32Type);
-            build_decimal(values, validity, dtype)?
+            build_decimal(values, validity, dtype, ctx)?
         }
         PhysicalType::INT32 => {
             let (values, validity) = selected!(Int32Type);
@@ -1296,7 +1304,7 @@ pub(crate) fn decode_selected_records(
         }
         PhysicalType::INT64 if dtype.is_decimal() => {
             let (values, validity) = selected!(Int64Type);
-            build_decimal(values, validity, dtype)?
+            build_decimal(values, validity, dtype, ctx)?
         }
         PhysicalType::INT64 => {
             let (values, validity) = selected!(Int64Type);
@@ -1671,7 +1679,7 @@ fn decode_page_parts(
     match data.descriptor.physical_type() {
         PhysicalType::BOOLEAN => decode_bool(data, values, valid, present),
         PhysicalType::INT32 if dtype.is_decimal() => {
-            decode_decimal_primitive::<Int32Type, i32>(data, values, valid, present, dtype)
+            decode_decimal_primitive::<Int32Type, i32>(data, values, valid, present, dtype, ctx)
         }
         PhysicalType::INT32 => {
             if let Some(array) =
@@ -1682,7 +1690,7 @@ fn decode_page_parts(
             decode_primitive::<Int32Type, i32>(data, values, valid, present, dtype)
         }
         PhysicalType::INT64 if dtype.is_decimal() => {
-            decode_decimal_primitive::<Int64Type, i64>(data, values, valid, present, dtype)
+            decode_decimal_primitive::<Int64Type, i64>(data, values, valid, present, dtype, ctx)
         }
         PhysicalType::INT64 => {
             decode_primitive::<Int64Type, i64>(data, values, valid, present, dtype)
@@ -2269,9 +2277,9 @@ fn register_compare_kernels(session: &VortexSession) {
     macro_rules! register {
         ($vtable:expr) => {{
             let kernels = session.kernels();
-            if !kernels.has_execute_parent(Binary.id(), $vtable.id()) {
+            if !kernels.has_execute_parent(Compare.id(), $vtable.id()) {
                 kernels.register_execute_parent_kernel(
-                    Binary.id(),
+                    Compare.id(),
                     $vtable,
                     CompareExecuteAdaptor($vtable),
                 );
@@ -2315,7 +2323,12 @@ fn register_cast_kernels(session: &VortexSession) {
 }
 
 /// Filters a page while its Parquet decoder is live, skipping encoded values for false mask runs.
-fn filter_page_parts(data: &ParquetPageData, dtype: &DType, mask: &Mask) -> VortexResult<ArrayRef> {
+fn filter_page_parts(
+    data: &ParquetPageData,
+    dtype: &DType,
+    mask: &Mask,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
     let page = data.page.page()?;
     let (values, valid) = value_stream_and_validity(page, data.descriptor.max_def_level())?;
     vortex_ensure!(
@@ -2343,13 +2356,13 @@ fn filter_page_parts(data: &ParquetPageData, dtype: &DType, mask: &Mask) -> Vort
             Ok(result.into_array())
         }
         PhysicalType::INT32 if dtype.is_decimal() => {
-            filter_decimal::<Int32Type, i32>(data, values, valid, present, mask, dtype)
+            filter_decimal::<Int32Type, i32>(data, values, valid, present, mask, dtype, ctx)
         }
         PhysicalType::INT32 => {
             filter_primitive::<Int32Type, i32>(data, values, valid, present, mask, dtype)
         }
         PhysicalType::INT64 if dtype.is_decimal() => {
-            filter_decimal::<Int64Type, i64>(data, values, valid, present, mask, dtype)
+            filter_decimal::<Int64Type, i64>(data, values, valid, present, mask, dtype, ctx)
         }
         PhysicalType::INT64 => {
             filter_primitive::<Int64Type, i64>(data, values, valid, present, mask, dtype)
@@ -2426,6 +2439,7 @@ fn filter_decimal<T, N>(
     present: usize,
     mask: &Mask,
     dtype: &DType,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef>
 where
     T: ParquetDataType<T = N>,
@@ -2436,17 +2450,17 @@ where
         let DType::Decimal(decimal_dtype, _) = dtype else {
             vortex_bail!("Parquet decimal decoder received non-decimal dtype {dtype}")
         };
-        return Ok(DecimalArray::try_new(
+        return decimal_array(
             values,
             *decimal_dtype,
             Validity::from(dtype.nullability()),
-        )?
-        .into_array());
+            ctx,
+        );
     }
     let mut decoder = make_decoder::<T>(data, values, present)?;
     let (decoded, selected_valid) =
         decode_masked::<T, N>(decoder.as_mut(), valid.as_deref(), mask)?;
-    build_decimal(decoded, selected_valid, dtype)
+    build_decimal(decoded, selected_valid, dtype, ctx)
 }
 
 /// PLAIN numeric offsets are known without advancing a decoder. Read just the selected values,
@@ -2942,6 +2956,7 @@ fn decode_decimal_primitive<T, N>(
     valid: Option<Vec<bool>>,
     present: usize,
     dtype: &DType,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef>
 where
     T: ParquetDataType<T = N>,
@@ -2956,7 +2971,7 @@ where
         } else {
             Validity::NonNullable
         };
-        return Ok(DecimalArray::try_new(values, *decimal_dtype, validity)?.into_array());
+        return decimal_array(values, *decimal_dtype, validity, ctx);
     }
     let mut decoder = make_decoder::<T>(data, values, present)?;
     let mut decoded = vec![N::default(); present];
@@ -2967,13 +2982,14 @@ where
         count == present,
         "Parquet decoder returned {count} of {present} decimal values"
     );
-    build_decimal(decoded, valid, dtype)
+    build_decimal(decoded, valid, dtype, ctx)
 }
 
 fn build_decimal<N>(
     decoded: Vec<N>,
     valid: Option<Vec<bool>>,
     dtype: &DType,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef>
 where
     N: NativePType + NativeDecimalType + Default,
@@ -2982,7 +2998,7 @@ where
         vortex_bail!("Parquet decimal decoder received non-decimal dtype {dtype}")
     };
     let (values, validity) = scatter(decoded, valid);
-    Ok(DecimalArray::try_new(Buffer::from(values), *decimal_dtype, validity)?.into_array())
+    decimal_array(Buffer::from(values), *decimal_dtype, validity, ctx)
 }
 
 /// Applies Parquet's logical annotation without going through Arrow.
@@ -3597,4 +3613,26 @@ fn decode_levels(
         "decoded {decoded} of {count} definition levels"
     );
     Ok(levels.into_iter().map(|level| level == max_level).collect())
+}
+
+fn decimal_array<N: NativeDecimalType>(
+    values: Buffer<N>,
+    dtype: DecimalDType,
+    validity: Validity,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let width = dtype.canonical_values_type();
+    let values = if N::DECIMAL_TYPE == width {
+        BufferHandle::new_host(values.into_byte_buffer())
+    } else {
+        let mask = validity.execute_mask(values.len(), ctx)?;
+        copy_to_canonical_width(values.as_slice(), &mask, dtype)?
+    };
+    Ok(DecimalArray::try_new_handle_from_trusted_values(
+        values,
+        dtype.canonical_values_type(),
+        dtype,
+        validity,
+    )?
+    .into_array())
 }

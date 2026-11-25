@@ -23,10 +23,10 @@ use vortex::array::optimizer::ArrayOptimizer;
 use vortex::array::optimizer::kernels::ArrayKernelsExt;
 use vortex::array::optimizer::rules::ArrayParentReduceRule;
 use vortex::error::VortexResult;
+use vortex::functions::list_contains::ListContains;
+use vortex::functions::list_contains::PreparedSet;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTable;
-use vortex::scalar_fn::fns::list_contains::ListContains;
-use vortex::scalar_fn::fns::list_contains::PreparedSet;
 use vortex::session::VortexSession;
 
 pub(super) fn register(session: &VortexSession) {

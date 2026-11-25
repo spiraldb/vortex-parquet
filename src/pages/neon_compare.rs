@@ -43,7 +43,7 @@ use std::arch::aarch64::vmvnq_u32;
 
 use vortex::buffer::BitBuffer;
 use vortex::buffer::BufferMut;
-use vortex::scalar_fn::fns::operators::CompareOperator;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 
 #[target_feature(enable = "neon")]
 pub(super) fn compare(

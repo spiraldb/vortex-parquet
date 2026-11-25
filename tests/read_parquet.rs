@@ -3,7 +3,6 @@
 //! End-to-end tests over real Parquet files.
 
 #![expect(clippy::tests_outside_test_module)]
-#![expect(clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -64,6 +63,7 @@ use vortex::array::stream::ArrayStreamExt;
 use vortex::array::vtable::VTable;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::ExecuteArrowExt;
+use vortex::expr::ArrayExprExt;
 #[allow(dead_code)] // Reuse the production Arrow bridge; this test needs only array import.
 #[path = "../src/arrow_bridge.rs"]
 mod arrow_bridge;
@@ -90,6 +90,7 @@ use vortex::expr::or;
 use vortex::expr::root;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
+use vortex::functions::list_contains::ListContainsOptions;
 use vortex::io::VortexReadAt;
 use vortex::io::runtime::single::block_on;
 use vortex::io::session::RuntimeSessionExt;
@@ -100,10 +101,9 @@ use vortex::mask::Mask;
 use vortex::scalar::DecimalValue;
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::ScalarFnVTable;
-use vortex::scalar_fn::fns::cast::Cast;
-use vortex::scalar_fn::fns::cast::CastExecuteAdaptor;
-use vortex::scalar_fn::fns::list_contains::ListContainsOptions;
-use vortex::scalar_fn::fns::operators::CompareOperator;
+use vortex::scalar_fn::builtin::cast::Cast;
+use vortex::scalar_fn::builtin::cast::CastExecuteAdaptor;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 use vortex::scan::ScanRequest;
 use vortex::scan::selection::Selection;
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
@@ -847,7 +847,11 @@ fn data_source_preserves_nulls_and_dynamic_bounds_when_eliminating_filters() {
                 (
                     gt_eq(
                         get_item("time", root()),
-                        lit(Scalar::from(1000i64).cast(&time_dtype).unwrap()),
+                        lit(Scalar::try_extension_ref(
+                            time_dtype.as_extension().clone(),
+                            Scalar::primitive(1000i64, time_dtype.nullability()),
+                        )
+                        .unwrap()),
                     ),
                     8,
                     true,

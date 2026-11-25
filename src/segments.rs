@@ -25,6 +25,7 @@ use vortex::file::segments::FileSegmentSource;
 use vortex::file::segments::RequestMetrics;
 use vortex::io::VortexReadAt;
 use vortex::io::runtime::Handle;
+use vortex::io::segments::SegmentLocation;
 use vortex::layout::segments::SegmentFuture;
 use vortex::layout::segments::SegmentId;
 use vortex::layout::segments::SegmentSource;
@@ -147,7 +148,15 @@ impl SegmentTable {
         handle: Handle,
         metrics: &dyn MetricsRegistry,
     ) -> Arc<dyn SegmentSource> {
-        let specs: Arc<[SegmentSpec]> = Arc::from(self.specs);
+        let specs: Arc<[SegmentLocation]> = self
+            .specs
+            .into_iter()
+            .map(|spec| SegmentLocation {
+                offset: spec.offset,
+                length: spec.length,
+                alignment: spec.alignment,
+            })
+            .collect();
         Arc::new(LazyFileSegmentSource {
             specs,
             reader,
@@ -162,7 +171,7 @@ impl SegmentTable {
 /// runtime can finish footer-only futures without polling background tasks; eagerly spawned
 /// drivers would otherwise retain discarded planning-only files until a later data scan.
 struct LazyFileSegmentSource<R> {
-    specs: Arc<[SegmentSpec]>,
+    specs: Arc<[SegmentLocation]>,
     reader: R,
     handle: Handle,
     metrics: RequestMetrics,

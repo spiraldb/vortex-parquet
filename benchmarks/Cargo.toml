@@ -10,8 +10,8 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = "1"
-arrow-array = "59.2"
-arrow-schema = "59.2"
+arrow-array = "60.1"
+arrow-schema = "60.1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 # Must match the major that `vortex-datafusion` pins for the DataFusion *component* crates
@@ -19,17 +19,17 @@ clap = { version = "4", features = ["derive"] }
 # agree with it — a mismatch surfaces as `TableProvider is not satisfied`, because the two halves see
 # different `TableProvider` traits. Check with `cargo tree -p datafusion-catalog` after bumping
 # either this or the Vortex pin.
-datafusion = "55"
+datafusion = "56"
 futures = "0.3"
 # Only for `posix_fadvise(POSIX_FADV_DONTNEED)`, which evicts one file from the page cache without
 # root — unlike `drop_caches`, which needs root and would evict everything else on the box too.
 libc = "0.2"
 # The `gcp` feature is what provides `GoogleCloudStorageBuilder`; the crate itself is already in the
 # tree via vortex and datafusion, so this enables a backend rather than adding a dependency.
-object_store = { version = "0.13", features = ["gcp"] }
+object_store = { version = "0.14.2", features = ["gcp"] }
 # Only for the `--recompress` mode, which rewrites a file with a different codec so the codec can be
 # treated as a variable rather than a property of the format.
-parquet = { version = "59.2", default-features = false, features = [
+parquet = { version = "60.1", default-features = false, features = [
     "arrow",
     "snap",
     "zstd",

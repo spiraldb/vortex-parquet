@@ -66,7 +66,9 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
+use vortex::expr::ArrayExprExt;
 use vortex::expr::BoundExpression;
+use vortex::functions::dynamic::DynamicExprUpdates;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutReader;
 use vortex::layout::RowSplits;
@@ -76,10 +78,9 @@ use vortex::layout::segments::SegmentId;
 use vortex::layout::segments::SegmentSource;
 use vortex::mask::Mask;
 use vortex::scalar::Scalar;
-use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::dynamic::DynamicExprUpdates;
-use vortex::scalar_fn::fns::literal::Literal;
-use vortex::scalar_fn::fns::operators::Operator;
+use vortex::scalar_fn::builtin::compare::Compare;
+use vortex::scalar_fn::builtin::literal::Literal;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 use vortex::session::VortexSession;
 
 use crate::cache::ChunkKey;
@@ -678,11 +679,11 @@ impl CachedDecode {
                         .metadata
                         .row_group(self.inputs.row_group)
                         .column(leaf),
-                    &schema.column(leaf),
                     &self.dtype,
                     self.row_count,
                     row_range,
                     mask,
+                    &mut self.inputs.file.session().create_execution_ctx(),
                 )?
             } else {
                 None
@@ -1447,7 +1448,7 @@ fn page_pruning_indexes(
 /// property here, rather than field names or SQL syntax, also covers commuted equalities produced by
 /// expression normalization.
 fn equality_literal(expr: &BoundExpression) -> Option<&Scalar> {
-    if expr.as_opt::<Binary>().copied() != Some(Operator::Eq) {
+    if expr.as_opt::<Compare>().copied() != Some(CompareOperator::Eq) {
         return None;
     }
     let lhs = expr.child(0);
