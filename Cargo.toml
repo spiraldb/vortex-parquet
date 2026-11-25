@@ -46,7 +46,7 @@ simdutf8 = "0.1.5"
 # the module, change the decoder's signature, or alter its semantics. The first two break the build,
 # which is loud. The third would be quiet — so treat a parquet bump as requiring a rerun of the
 # page-path tests, not just a green build.
-parquet = { version = "58.4", default-features = false, features = [
+parquet = { version = "58.4.2", default-features = false, features = [
     "arrow",
     "brotli",
     "crc",
@@ -56,7 +56,7 @@ parquet = { version = "58.4", default-features = false, features = [
     "snap",
     "zstd",
 ] }
-thrift = { version = "0.17", default-features = false }
+thrift = { version = "0.23", default-features = false }
 vortex = { workspace = true, features = [
     "files",
     "object_store",
