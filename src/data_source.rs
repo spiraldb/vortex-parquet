@@ -32,23 +32,23 @@ use vortex::error::vortex_bail;
 use vortex::expr::BoundExpression;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
-use vortex::expr::referenced_field_paths;
 use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
 use vortex::expr::traversal::TraversalOrder;
 use vortex::expr::traversal::pre_order_visit_down;
+use vortex::functions::select::FieldSelection;
+use vortex::functions::select::Select;
 use vortex::layout::LayoutReaderRef;
 use vortex::layout::scan::repeated_scan::RepeatedScan;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::scan::split_by::SplitBy;
 use vortex::scalar::Scalar;
-use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::get_item::GetItem;
-use vortex::scalar_fn::fns::literal::Literal;
-use vortex::scalar_fn::fns::operators::CompareOperator;
-use vortex::scalar_fn::fns::operators::Operator;
-use vortex::scalar_fn::fns::select::FieldSelection;
-use vortex::scalar_fn::fns::select::Select;
+use vortex::scalar_fn::builtin::boolean::Boolean;
+use vortex::scalar_fn::builtin::compare::Compare;
+use vortex::scalar_fn::builtin::get_item::GetItem;
+use vortex::scalar_fn::builtin::literal::Literal;
+use vortex::scalar_fn::builtin::operators::BooleanOperator;
+use vortex::scalar_fn::builtin::operators::CompareOperator;
 use vortex::scan::DataSource;
 use vortex::scan::DataSourceScan;
 use vortex::scan::DataSourceScanRef;
@@ -56,6 +56,7 @@ use vortex::scan::Partition;
 use vortex::scan::PartitionRef;
 use vortex::scan::PartitionStream;
 use vortex::scan::ScanRequest;
+use vortex::scan::analysis::referenced_field_paths;
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::utils::aliases::hash_map::HashMap;
@@ -106,7 +107,7 @@ impl ParquetDataSource {
         expression: Expression,
         statistics: &mut HashMap<FieldName, StatsSet>,
     ) -> VortexResult<Option<Expression>> {
-        if expression.as_opt::<Binary>() == Some(&Operator::And) {
+        if expression.as_opt::<Boolean>() == Some(&BooleanOperator::And) {
             let children = expression
                 .children()
                 .iter()
@@ -127,10 +128,7 @@ impl ParquetDataSource {
         expression: &Expression,
         statistics: &mut HashMap<FieldName, StatsSet>,
     ) -> VortexResult<bool> {
-        let Some(operator) = expression
-            .as_opt::<Binary>()
-            .and_then(|op| op.to_compare_operator())
-        else {
+        let Some(operator) = expression.as_opt::<Compare>().copied() else {
             return Ok(false);
         };
         let (column, value, operator) = if let Some(value) = expression.child(1).as_opt::<Literal>()
