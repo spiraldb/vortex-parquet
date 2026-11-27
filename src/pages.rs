@@ -2740,6 +2740,13 @@ where
         && direct_dtype(parent.dtype(), array.data().descriptor.physical_type())
         && (parent.dtype().is_nullable() || !array.dtype().is_nullable())
     {
+        if matches!(
+            (array.dtype(), parent.dtype()),
+            (DType::Primitive(..), DType::Primitive(..))
+        ) && let Some(dictionary) = reduce_dictionary_page(array.data(), array.dtype())?
+        {
+            return Ok(Some(dictionary.cast(parent.dtype().clone())?));
+        }
         // A cast target supported by the Parquet decoder is a metadata rewrite until somebody asks
         // for values. This preserves the encoded page below LIKE/compare and performs conversion
         // (including UTF-8 validation) exactly once during decode.

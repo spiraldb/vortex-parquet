@@ -28,6 +28,7 @@ use arrow_array::UInt32Array;
 use arrow_array::builder::Int32Builder;
 use arrow_array::builder::ListBuilder;
 use arrow_array_vortex::BooleanArray;
+use arrow_array_vortex::Int32Array as VortexInt32Array;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Fields;
@@ -1110,6 +1111,54 @@ fn dictionary_pages_reduce_lazily_to_native_dict_for_property_driven_pushdown() 
             lengths.is::<Dict>(),
             "property-driven pushdown did not expose native dictionary codes: {}",
             lengths.encoding_id()
+        );
+    })
+}
+
+#[test]
+fn widening_a_dictionary_page_retains_dictionary_encoding() {
+    block_on(|handle| async move {
+        let session = VortexSession::default().with_handle(handle);
+        let values = Int16Array::from(vec![Some(10), Some(20), None, Some(10), Some(20), None]);
+        let batch = RecordBatch::try_from_iter_with_nullable([(
+            "value",
+            Arc::new(values) as ArrowArrayRef,
+            true,
+        )])
+        .unwrap();
+        let result = scan(
+            &session,
+            open(&session, write_parquet(&batch, 6)).await.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let page = result
+            .depth_first_traversal()
+            .find(|array| array.is::<ParquetRleDictionary>())
+            .expect("fixture must use dictionary encoding");
+        let mut ctx = session.create_execution_ctx();
+        let cast = page
+            .cast(DType::Primitive(PType::I32, Nullability::Nullable))
+            .unwrap()
+            .optimize_recursive(&session)
+            .unwrap();
+        let dictionary = cast.execute_until::<Dict>(&mut ctx).unwrap();
+        assert!(
+            dictionary.is::<Dict>(),
+            "numeric widening expanded the dictionary: {}",
+            dictionary.encoding_id()
+        );
+        assert_eq!(
+            dictionary.dtype(),
+            &DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+        let actual = dictionary.execute_arrow(None, &mut ctx).unwrap();
+        let expected =
+            VortexInt32Array::from(vec![Some(10), Some(20), None, Some(10), Some(20), None]);
+        assert_eq!(
+            actual.as_any().downcast_ref::<VortexInt32Array>().unwrap(),
+            &expected
         );
     })
 }
